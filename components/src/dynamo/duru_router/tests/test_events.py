@@ -1,0 +1,100 @@
+import json
+import threading
+import time
+from unittest.mock import patch
+
+import pytest
+from dynamo.duru_router.events import CompactFeed, open_journal
+from dynamo.duru_router.scoring import Tail
+
+
+def test_compact_coordinates_and_clock_ordering(tmp_path):
+    feed = CompactFeed(tmp_path)
+    clock_started, clock_written = threading.Event(), threading.Event()
+    original_emit = feed.emit
+
+    def emit(event, **fields):
+        if event == "u_clock":
+            clock_started.set()
+        original_emit(event, **fields)
+        if event == "u_clock":
+            clock_written.set()
+
+    try:
+        with patch.object(feed, "emit", emit):
+            with feed.lock:
+                end = time.time()
+                step = dict(
+                    root="r",
+                    agent="a",
+                    client_request_id="req",
+                    scheduled_at=end - 0.001,
+                    end=end,
+                    p=12,
+                    d=0,
+                    k=12,
+                    phase="prefill",
+                    accepted=True,
+                    generated_tokens=1,
+                    prompt_tokens=999,
+                )
+                feed.capture("scheduled", dict(steps=[step]))
+                # The real clock thread attempts a write while the callback owns
+                # the lock. Its newer timestamp must follow accepted work.
+                assert clock_started.wait(timeout=1)
+                feed.capture(
+                    "accepted_output", dict(steps=[step, dict(step, accepted=False)])
+                )
+            assert clock_written.wait(timeout=1)
+    finally:
+        feed.close()
+    tail = Tail(tmp_path / "compact-work.jsonl")
+    rows = tail.read()
+    index = next(i for i, row in enumerate(rows) if row["event"] == "accepted_output")
+    accepted = rows[index]["steps"]
+    assert len(accepted) == 1
+    assert accepted[0]["p"] == 12
+    assert "prompt_tokens" not in accepted[0]
+    assert all(row["time"] <= end for row in rows[:index] if row["event"] == "u_clock")
+    assert any(row["event"] == "u_clock" for row in rows[index + 1 :])
+    assert tail.sequence == len(rows)
+    assert tail.watermark > end
+
+
+def test_feed_error_still_closes_writer(tmp_path):
+    feed = CompactFeed(tmp_path)
+    feed.error = RuntimeError("clock failed")
+    with pytest.raises(RuntimeError, match="feed failed"):
+        feed.close()
+    assert not feed.thread.is_alive()
+    assert not feed.journal.thread.is_alive()
+    assert feed.journal.proc.returncode == 0
+
+
+def test_flush_preserves_order_and_writes_only_event_stream(tmp_path):
+    journal = open_journal(tmp_path, name="events")
+    try:
+        for sequence in range(3):
+            journal.submit("record", {"sequence": sequence, "event": "u_clock"})
+        journal.flush(timeout=5)
+        path = tmp_path / "events.jsonl"
+        assert [
+            json.loads(line)["sequence"] for line in path.read_text().splitlines()
+        ] == [0, 1, 2]
+        assert list(tmp_path.iterdir()) == [path]
+    finally:
+        journal.close()
+    assert not journal.thread.is_alive()
+    assert journal.proc.returncode == 0
+
+
+def test_writer_failure_surfaces_and_close_releases_resources(tmp_path):
+    journal = open_journal(tmp_path, name="events")
+    journal.proc.kill()
+    journal.proc.wait(timeout=5)
+    with pytest.raises(RuntimeError, match="writer is closed"):
+        journal.submit("record", {"event": "u_clock"})
+    with pytest.raises(RuntimeError):
+        journal.close()
+    assert journal.closed
+    assert not journal.thread.is_alive()

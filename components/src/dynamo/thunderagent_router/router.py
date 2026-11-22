@@ -14,9 +14,10 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from dynamo.thunderagent_router.capacity import WorkerCapacityProvider
+if TYPE_CHECKING:
+    from dynamo.thunderagent_router.capacity import WorkerCapacityProvider
 from dynamo.thunderagent_router.program_state import (
     Program,
     ProgramLifecycle,
@@ -81,6 +82,8 @@ class _AdmissionGate:
 
 
 class ThunderAgentScheduler:
+    program_table_cls = ProgramTable
+
     def __init__(
         self,
         capacity: WorkerCapacityProvider,
@@ -88,7 +91,7 @@ class ThunderAgentScheduler:
     ) -> None:
         self._capacity = capacity
         self._cfg = config
-        self._table = ProgramTable()
+        self._table = self.program_table_cls()
         self._lock = asyncio.Lock()
         self._admission_gates: dict[str, _AdmissionGate] = {}
         self._scheduler_task: Optional[asyncio.Task] = None
@@ -148,44 +151,30 @@ class ThunderAgentScheduler:
         estimated_prompt_tokens: int,
     ) -> PauseDecision:
         wait_started = time.monotonic()
-        async with self._lock:
-            snapshot = self._table.snapshot_request(program_id)
-            wait_event, was_paused = self._admit_locked(
-                program_id, estimated_prompt_tokens
-            )
-            # No await can replace this program before its identity is captured.
-            admitted = self._table.programs.get(program_id)
-            admitted_epoch = admitted.admission_epoch if admitted is not None else None
+        while True:
+            async with self._lock:
+                if self._admission_ready(program_id):
+                    snapshot = self._table.snapshot_request(program_id)
+                    wait_event, was_paused = self._admit_locked(
+                        program_id, estimated_prompt_tokens
+                    )
+                    # No await can replace this program before its identity is captured.
+                    admitted = self._table.programs.get(program_id)
+                    admitted_epoch = (
+                        admitted.admission_epoch if admitted is not None else None
+                    )
+                    break
+            await asyncio.sleep(0.02)
 
         try:
             if wait_event is not None:
-                try:
-                    await asyncio.wait_for(
-                        wait_event.wait(), timeout=self._cfg.resume_timeout_seconds
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "Forced resume for %s after %.1fs",
-                        program_id,
-                        self._cfg.resume_timeout_seconds,
-                    )
-                    async with self._lock:
-                        program = self._table.programs.get(program_id)
-                        if (
-                            program is not None
-                            and program.lifecycle == ProgramLifecycle.PAUSED
-                        ):
-                            usage = self._replica_usage_locked(
-                                self._capacity.snapshot()
-                            )
-                            replica = self._least_loaded_replica_locked(usage)
-                            self._resume_program(program, replica)
-                            self._stat_forced_resumes += 1
+                await self._wait_for_resume(program_id, wait_event)
 
             waited = time.monotonic() - wait_started
 
             async with self._lock:
                 program = self._table.programs.get(program_id)
+                self._check_admission_owner(program, admitted, admitted_epoch)
                 if program is None:
                     return PauseDecision(program_id=program_id, waited_seconds=waited)
 
@@ -213,6 +202,33 @@ class ThunderAgentScheduler:
                 program_id, snapshot, admitted, admitted_epoch
             )
             raise
+
+    def _admission_ready(self, program_id: str) -> bool:
+        return True
+
+    async def _wait_for_resume(
+        self, program_id: str, wait_event: asyncio.Event
+    ) -> None:
+        try:
+            await asyncio.wait_for(
+                wait_event.wait(), timeout=self._cfg.resume_timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Forced resume for %s after %.1fs",
+                program_id,
+                self._cfg.resume_timeout_seconds,
+            )
+            async with self._lock:
+                program = self._table.programs.get(program_id)
+                if program is not None and program.lifecycle == ProgramLifecycle.PAUSED:
+                    usage = self._replica_usage_locked(self._capacity.snapshot())
+                    replica = self._least_loaded_replica_locked(usage)
+                    self._resume_program(program, replica)
+                    self._stat_forced_resumes += 1
+
+    def _check_admission_owner(self, program, admitted, admitted_epoch) -> None:
+        """An adapter may reject an admission superseded while it was waiting."""
 
     async def _rollback_admission_shielded(
         self,
