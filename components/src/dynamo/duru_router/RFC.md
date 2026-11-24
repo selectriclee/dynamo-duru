@@ -1,6 +1,5 @@
 # DEP: Pluggable Duru fairness policy with a ThunderAgent adapter
 
-Status: Local DEP draft; not filed on GitHub. Interfaces and PR boundaries are subject to maintainer review.
 Area: router, with a separately reviewed vLLM adapter.
 
 ## Summary
