@@ -6,6 +6,7 @@
 import json
 import os
 import tempfile
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ import pytest
 
 from dynamo.duru_router import scoring
 from dynamo.duru_router.calibration.plan import METRIC
+from dynamo.duru_router.events import open_feed
 
 
 @pytest.fixture(autouse=True)
@@ -98,3 +100,57 @@ def replay_accounting(config, stop=None, *, router_publish=None):
         patch.dict(os.environ, DURU_ACCOUNTING_TRANSPORT="memory"),
     ):
         scoring.run(config, stop, router_publish=router_publish)
+
+
+def work_step(*, p=100, d=0, root="root", agent="agent", phase="prefill", **fields):
+    return dict(
+        accepted=True,
+        root=root,
+        agent=agent,
+        phase=phase,
+        p=p,
+        d=d,
+        k=p + d,
+        generated_tokens=1,
+        **fields,
+    )
+
+
+def arrival_record(
+    time=100,
+    request_id="req",
+    program_id="native/session",
+    *,
+    root="root",
+    agent="agent",
+):
+    return dict(
+        time=time,
+        event="request_arrived",
+        request_id=request_id,
+        program_id=program_id,
+        prompt_tokens=8,
+        root=root,
+        agent=agent,
+    )
+
+
+@contextmanager
+def event_feeds(config, ingress_rows, worker_rows, *, in_process):
+    """Seed both event sources and close every producer, even if setup fails."""
+    ingress = None
+    with ExitStack() as stack:
+        for logical, rows in [
+            (config["ingress"], ingress_rows),
+            (config["ledgers"][0], worker_rows),
+        ]:
+            path = Path(logical)
+            if in_process and logical == config["ingress"]:
+                ingress = scoring.Ingress(path.parent, in_process=True)
+                feed = ingress.journal
+            else:
+                feed = open_feed(path.parent, name=path.stem)
+            stack.callback(feed.close)
+            for sequence, row in enumerate(rows, 1):
+                feed.submit("record", dict(row, sequence=sequence))
+        yield ingress

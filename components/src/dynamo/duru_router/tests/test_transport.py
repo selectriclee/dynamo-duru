@@ -20,9 +20,9 @@ import pytest
 from dynamo.duru_router import scoring, transport
 from dynamo.duru_router.events import open_feed
 from dynamo.duru_router.scoring import EventStreamReader, LiveU, Reader, run
-from dynamo.duru_router.tests.helpers import configuration
+from dynamo.duru_router.tests.helpers import arrival_record, configuration, event_feeds
 from dynamo.duru_router.tests.helpers import memory_mode as memory_mode
-from dynamo.duru_router.tests.helpers import replay_accounting
+from dynamo.duru_router.tests.helpers import replay_accounting, work_step
 from dynamo.duru_router.transport import (
     MAX_FRAME,
     InProcessChannel,
@@ -263,18 +263,7 @@ def test_root_cleanup_retains_tool_gap_then_releases_all_history():
         root, agent = f"root-{i}", f"agent-{i}"
         t = i * 10
         book.submit("request", root, agent, 10, t)
-        book.accepted(
-            dict(
-                root=root,
-                agent=agent,
-                accepted=True,
-                phase="decode",
-                p=1,
-                d=10,
-                k=11,
-                generated_tokens=1,
-            )
-        )
+        book.accepted(work_step(p=1, d=10, root=root, agent=agent, phase="decode"))
         with pytest.raises(ValueError, match="outstanding requests"):
             book.finish_root(root, t)
         book.finish("request", t + 1)
@@ -308,35 +297,11 @@ def test_identical_events_have_identical_u_in_ipc_and_recorded_replay(
     path, cfg = configuration(tmp_path)
     monkeypatch.setenv("DURU_RECORD_EVENTS", "1")
     ingress = [
-        dict(
-            event="request_arrived",
-            time=100,
-            request_id="q",
-            root="r",
-            agent="a",
-            program_id="p",
-            prompt_tokens=8,
-        ),
+        arrival_record(100, "q", "p", root="r", agent="a"),
         dict(event="request_completed", time=101, request_id="q"),
         # Callback at 102 arrives after ingress completion at 101.
-        dict(
-            event="request_arrived",
-            time=103,
-            request_id="q2",
-            root="r",
-            agent="a",
-            program_id="p",
-            prompt_tokens=8,
-        ),
-        dict(
-            event="request_arrived",
-            time=103,
-            request_id="child",
-            root="r",
-            agent="b",
-            program_id="pb",
-            prompt_tokens=8,
-        ),
+        arrival_record(103, "q2", "p", root="r", agent="a"),
+        arrival_record(103, "child", "pb", root="r", agent="b"),
         dict(event="request_completed", time=104, request_id="q2"),
         dict(event="request_completed", time=105, request_id="child"),
     ]
@@ -346,18 +311,8 @@ def test_identical_events_have_identical_u_in_ipc_and_recorded_replay(
             dict(event="agent_group_end", time=107, root="r"),
         ]
     ingress.append(dict(event="footer", time=108))
-    step = dict(
-        client_request_id="q",
-        root="r",
-        agent="a",
-        scheduled_at=100.5,
-        end=102,
-        phase="prefill",
-        p=8,
-        d=0,
-        k=8,
-        accepted=True,
-        generated_tokens=1,
+    step = work_step(
+        p=8, root="r", agent="a", client_request_id="q", scheduled_at=100.5, end=102
     )
     worker = [
         dict(event="accepted_output", time=102, steps=[step]),
@@ -375,29 +330,14 @@ def test_identical_events_have_identical_u_in_ipc_and_recorded_replay(
                 requests=[dict(client_request_id="q", root="r", agent="a")],
             ),
         ]
-    feeds = []
-    ingress_source = None
-    for logical, rows in [(cfg["ingress"], ingress), (cfg["ledgers"][0], worker)]:
-        logical = Path(logical)
-        if in_process and str(logical) == cfg["ingress"]:
-            local = scoring.Ingress(logical.parent, in_process=True)
-            feed = ingress_source = local.journal
-        else:
-            feed = open_feed(logical.parent, name=logical.stem)
-        feeds.append(feed)
-        for i, row in enumerate(rows, 1):
-            feed.submit("record", dict(row, sequence=i))
     snapshots = []
     stop = threading.Event()
     stop.set()
     for mode in ("memory", "journal"):
         monkeypatch.setenv("DURU_ACCOUNTING_TRANSPORT", mode)
         if mode == "memory":
-            try:
-                run_memory(path, ingress_source=ingress_source)
-            finally:
-                for feed in feeds:
-                    feed.close()
+            with event_feeds(cfg, ingress, worker, in_process=in_process) as local:
+                run_memory(path, ingress_source=local.journal if local else None)
         else:
             replay_accounting(path, stop)
         footer = json.loads(

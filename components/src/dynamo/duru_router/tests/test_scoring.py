@@ -13,27 +13,12 @@ from unittest.mock import patch
 import pytest
 
 from dynamo.duru_router import scoring
-from dynamo.duru_router.events import open_feed
 from dynamo.duru_router.scoring import Ingress, LiveU, priority_key, run
-from dynamo.duru_router.tests.helpers import configuration
+from dynamo.duru_router.tests.helpers import arrival_record, configuration, event_feeds
 from dynamo.duru_router.tests.helpers import memory_mode as memory_mode
-from dynamo.duru_router.tests.helpers import replay_accounting
+from dynamo.duru_router.tests.helpers import replay_accounting, work_step
 
 pytestmark = [pytest.mark.gpu_0]
-
-
-def work_step(*, p=100, d=0, root="root", agent="agent", **fields):
-    return dict(
-        accepted=True,
-        root=root,
-        agent=agent,
-        phase="prefill",
-        p=p,
-        d=d,
-        k=p + d,
-        generated_tokens=1,
-        **fields,
-    )
 
 
 def make_book(capacity=4):
@@ -58,16 +43,17 @@ def test_children_split_root_ps_share_and_tool_gaps():
 
 @pytest.mark.pre_merge
 @pytest.mark.unit
-def test_parallel_children_sum_time_and_work():
+@pytest.mark.parametrize("agents", [2, 5], ids=["parallel", "fanout-capped"])
+def test_parallel_children_sum_time_and_work(agents):
     book = make_book(2)
     book.cost = lambda *args: 10.0
-    for agent in ("child1", "child2"):
+    for agent in range(agents):
         book.submit(agent, "root", agent, 100, 0)
         book.accepted(work_step(agent=agent))
     book.advance(10)
     assert book.entitlement["root"] == 20.0
-    assert book.work["root"] == 20.0
-    assert book.measured("root") == 1.0
+    assert book.work["root"] == agents * 10
+    assert book.measured("root") == 2 / agents
 
 
 @pytest.mark.pre_merge
@@ -102,16 +88,6 @@ def test_unused_root_share_is_not_redistributed():
     book.submit("d", "X", "d", 100, 10)
     book.advance(20)
     assert dict(book.entitlement) == {"X": 40.0, "Y": 20.0}
-
-
-@pytest.mark.pre_merge
-@pytest.mark.unit
-def test_single_root_fanout_capped_at_replica_count():
-    book = make_book(2)
-    for i in range(5):
-        book.submit(str(i), "root", str(i), 100, 0)
-    book.advance(10)
-    assert book.entitlement["root"] == 20.0
 
 
 @pytest.mark.pre_merge
@@ -261,25 +237,6 @@ def write_rows(path, rows):
 
 def read_rows(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
-
-
-def arrival_record(
-    time=100,
-    request_id="req",
-    program_id="native/session",
-    *,
-    root="root",
-    agent="agent",
-):
-    return dict(
-        time=time,
-        event="request_arrived",
-        request_id=request_id,
-        program_id=program_id,
-        prompt_tokens=8,
-        root=root,
-        agent=agent,
-    )
 
 
 @pytest.fixture
@@ -534,88 +491,62 @@ def test_router_owned_accounting_matches_worker_snapshot(
     monkeypatch.setenv("DURU_RECORD_EVENTS", "1" if record else "0")
     monkeypatch.setenv("DURU_DIAGNOSTICS", "1" if diagnostics else "0")
     now = time.time()
-    step = dict(
-        root="r",
-        agent="a",
-        client_request_id="q",
-        accepted=True,
-        phase="prefill",
-        p=8,
-        d=0,
-        k=8,
-        generated_tokens=1,
-        scheduled_at=now,
-        end=now + 0.001,
-    )
-    streams = [
-        (
-            cfg["ingress"],
-            [
-                dict(
-                    event="request_arrived",
-                    time=now - 0.01,
+    ingress_rows = [
+        arrival_record(now - 0.01, "q", "p", root="r", agent="a"),
+        dict(event="footer", time=now + 0.002),
+    ]
+    worker_rows = [
+        dict(
+            event="accepted_output",
+            time=now + 0.001,
+            steps=[
+                work_step(
+                    p=8,
                     root="r",
                     agent="a",
-                    request_id="q",
-                    program_id="p",
-                    prompt_tokens=8,
-                ),
-                dict(event="footer", time=now + 0.002),
+                    client_request_id="q",
+                    scheduled_at=now,
+                    end=now + 0.001,
+                )
             ],
         ),
-        (
-            cfg["ledgers"][0],
-            [
-                dict(event="accepted_output", time=now + 0.001, steps=[step]),
-                dict(event="footer", time=now + 0.002),
-            ],
-        ),
+        dict(event="footer", time=now + 0.002),
     ]
-    feeds = []
-    ingress = None
-    for logical, rows in streams:
-        logical = Path(logical)
-        if in_process and str(logical) == cfg["ingress"]:
-            ingress = scoring.Ingress(logical.parent, in_process=True)
-            feed = ingress.journal
-        else:
-            feed = open_feed(logical.parent, name=logical.stem)
-        feeds.append(feed)
-        for i, row in enumerate(rows, 1):
-            feed.submit("record", dict(sequence=i, **row))
-    owner = scoring.RouterAccounting(path, ingress=ingress).start()
-    engine_reader = scoring.Reader()
-    try:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            snapshot = owner.reader.refresh()
-            engine_snapshot = engine_reader.refresh()
-            if snapshot.get("accepted_steps") == 1 and engine_snapshot.get("requests"):
-                break
-            time.sleep(0.01)
-        else:
-            pytest.fail("Router accounting failed to publish")
-        assert not Path(cfg["scores"]).exists()
-        assert engine_snapshot["requests"] == {
-            rid: {"score": row["score"]} for rid, row in snapshot["requests"].items()
-        }
-        assert ("roots" in snapshot) is (record or diagnostics)
-        assert ("source_sequences" in snapshot) is record
-        assert ("source_received_through" in snapshot) is record
-        if not record:
-            assert not Path(cfg["audit_dir"]).exists()
-            assert not list(tmp_path.rglob("*.jsonl"))
-        assert owner.reader.snapshot_source is not None
-        assert owner._thread is not threading.current_thread()
-        # File corruption cannot change the router's direct-memory decision.
-        monkeypatch.setattr(
-            Path, "read_text", lambda *a, **k: pytest.fail("Unexpected file read")
-        )
-        assert owner.reader.refresh()["programs"]["p"]["U"] is not None
-    finally:
-        for feed in feeds:
-            feed.close()
-        owner.close()
-        engine_reader.close()
-    assert not owner._thread.is_alive()
-    assert owner._snapshot == {}
+    with event_feeds(cfg, ingress_rows, worker_rows, in_process=in_process) as ingress:
+        owner = scoring.RouterAccounting(path, ingress=ingress).start()
+        engine_reader = scoring.Reader()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                snapshot = owner.reader.refresh()
+                engine_snapshot = engine_reader.refresh()
+                if snapshot.get("accepted_steps") == 1 and engine_snapshot.get(
+                    "requests"
+                ):
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("Router accounting failed to publish")
+            assert not Path(cfg["scores"]).exists()
+            assert engine_snapshot["requests"] == {
+                rid: {"score": row["score"]}
+                for rid, row in snapshot["requests"].items()
+            }
+            assert ("roots" in snapshot) is (record or diagnostics)
+            assert ("source_sequences" in snapshot) is record
+            assert ("source_received_through" in snapshot) is record
+            if not record:
+                assert not Path(cfg["audit_dir"]).exists()
+                assert not list(tmp_path.rglob("*.jsonl"))
+            assert owner.reader.snapshot_source is not None
+            assert owner._thread is not threading.current_thread()
+            # File corruption cannot change the router's direct-memory decision.
+            monkeypatch.setattr(
+                Path, "read_text", lambda *a, **k: pytest.fail("Unexpected file read")
+            )
+            assert owner.reader.refresh()["programs"]["p"]["U"] is not None
+        finally:
+            owner.close()
+            engine_reader.close()
+        assert not owner._thread.is_alive()
+        assert owner._snapshot == {}

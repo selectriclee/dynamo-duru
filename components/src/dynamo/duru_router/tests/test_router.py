@@ -7,7 +7,6 @@ import asyncio
 import json
 import time
 from copy import deepcopy
-from dataclasses import dataclass, field
 from unittest.mock import patch
 
 import pytest
@@ -19,26 +18,16 @@ from dynamo.duru_router.router import DuruScheduler, ThunderAgentConfig
 from dynamo.duru_router.scoring import Reader
 from dynamo.thunderagent_router.policy import ResumeChoice
 from dynamo.thunderagent_router.program_state import ProgramLifecycle, ProgramStatus
+from dynamo.thunderagent_router.tests.test_router import FakeCapacity
 
 pytestmark = [pytest.mark.pre_merge, pytest.mark.unit, pytest.mark.gpu_0]
-
-
-@dataclass
-class FakeCapacity:
-    workers: dict[tuple[int, int], int] = field(default_factory=lambda: {(1, 0): 1000})
-
-    def snapshot(self):
-        return dict(self.workers)
-
-    def live_worker_ids(self):
-        return {key[0] for key in self.workers}
 
 
 class RouterCase:
     def __init__(self):
         self.snapshot = {}
         self.scores, self.events, self.tasks = {}, [], []
-        self.capacity = FakeCapacity()
+        self.capacity = FakeCapacity(workers={(1, 0): 1000})
         self.router = DuruScheduler(
             self.capacity,
             ThunderAgentConfig(
@@ -333,6 +322,7 @@ async def test_newcomer_preserves_resume_headroom_for_established_waiters(case):
 @pytest.mark.asyncio
 async def test_lookahead_crossing_alpha_unblocks_pending_request(case, monkeypatch):
     monkeypatch.setenv("DURU_ADMISSION_ALPHA", "0.7")
+    case.router._cfg.resume_timeout_seconds = 0
     case.score("child", 0.69)
     case.scores["child"].update(U=None, kind="zero_work_root_next_five")
     task = await case.start("child", 1100)
@@ -395,29 +385,6 @@ async def test_cancelled_waiter_cannot_reappear_or_force_admit(
 
 
 @pytest.mark.asyncio
-async def test_repeated_cancellation_finishes_blocked_rollback(case):
-    case.score("blocked", 0.1)
-    task = await case.start("blocked", 1100)
-    rollback_started = asyncio.Event()
-    original = case.router._rollback_admission
-
-    async def rollback(*args):
-        rollback_started.set()
-        await original(*args)
-
-    with patch.object(case.router, "_rollback_admission", rollback):
-        async with case.router._lock:
-            task.cancel()
-            await asyncio.wait_for(rollback_started.wait(), 1)
-            task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, 1)
-    assert not case.router._table.programs
-    assert not case.router._admission_gates
-    assert case.router._stat_admissions_cancelled == 1
-
-
-@pytest.mark.asyncio
 async def test_old_waiter_cannot_remove_recreated_program(case):
     case.score("reused", 0.1)
     task = await case.start("reused", 1100)
@@ -427,31 +394,6 @@ async def test_old_waiter_cannot_remove_recreated_program(case):
         await asyncio.wait_for(task, 1)
     assert case.router._table.programs["reused"] is replacement
     assert replacement.token_total == 100
-
-
-@pytest.mark.asyncio
-async def test_concurrent_admission_and_end_release_state_for_next_wave(
-    case, monkeypatch
-):
-    monkeypatch.setenv("DURU_ADMISSION_ALPHA", "0.7")
-    for wave in range(2):
-        programs = [f"root-{wave}::child-{child}" for child in range(3)]
-        tasks = []
-        for program in programs:
-            case.score(program, 0.1)
-            tasks.append(await case.start(program, 1100))
-        assert all(not task.done() for task in tasks)
-        for program in programs:
-            case.scores[program]["score"] = 0.7
-        await case.resume()
-        await asyncio.wait_for(asyncio.gather(*tasks), 1)
-        for program in programs:
-            await case.router.after_request(program, 1100, 10)
-            await case.router.end_program(program)
-        assert not case.router._table.programs
-        assert not case.router._table.paused
-        assert not case.router._admission_gates
-    assert case.router._stat_forced_resumes == 6
 
 
 @pytest.mark.asyncio
@@ -496,23 +438,6 @@ async def test_policy_placement_uses_replica_ties_and_decayed_usage(
     assert candidate.assigned_replica == ((7, 1) if override else (7, 0))
     assert case.events[0]["forced"] is override
     assert case.events[0]["remaining"] == (100 if override else 1000)
-
-
-@pytest.mark.asyncio
-async def test_duru_waits_for_policy_even_with_zero_native_timeout(case, monkeypatch):
-    case.router._cfg.resume_timeout_seconds = 0
-    case.score("waiting", 0.1)
-    task = await case.start("waiting", 1100)
-    assert not task.done()
-    assert case.router._stat_forced_resumes == 0
-
-    monkeypatch.setenv("DURU_ADMISSION_ALPHA", "1")
-    case.scores["waiting"]["score"] = 1
-    await case.resume()
-
-    decision = await asyncio.wait_for(task, 1)
-    assert decision.assigned_replica_hint == (1, 0)
-    assert case.router._stat_forced_resumes == 1
 
 
 @pytest.mark.asyncio

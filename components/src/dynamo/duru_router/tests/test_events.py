@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from dynamo.duru_router.events import CompactFeed, open_journal
-from dynamo.duru_router.tests.helpers import Tail
+from dynamo.duru_router.tests.helpers import Tail, work_step
 
 pytestmark = [
     pytest.mark.post_merge,
@@ -32,18 +32,13 @@ def test_compact_coordinates_and_clock_ordering(tmp_path):
         with patch.object(feed, "emit", emit):
             with feed.lock:
                 end = time.time()
-                step = dict(
+                step = work_step(
+                    p=12,
                     root="r",
                     agent="a",
                     client_request_id="req",
                     scheduled_at=end - 0.001,
                     end=end,
-                    p=12,
-                    d=0,
-                    k=12,
-                    phase="prefill",
-                    accepted=True,
-                    generated_tokens=1,
                     prompt_tokens=999,
                 )
                 # The real clock thread attempts a write while the callback owns

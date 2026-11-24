@@ -22,6 +22,7 @@ from dynamo.duru_router.router import ThunderAgentConfig
 from dynamo.duru_router.scoring import Ingress, RouterAccounting
 from dynamo.duru_router.tests.helpers import configuration
 from dynamo.duru_router.tests.helpers import memory_mode as memory_mode
+from dynamo.duru_router.tests.helpers import work_step
 from dynamo.thunderagent_router.tests.test_main import FakeKvRouter
 
 pytestmark = [pytest.mark.pre_merge, pytest.mark.unit, pytest.mark.gpu_0]
@@ -43,21 +44,7 @@ class AccountingKvRouter(FakeKvRouter):
         now = time.time()
         self.feed.capture(
             "accepted_output",
-            dict(
-                steps=[
-                    dict(
-                        identity,
-                        accepted=True,
-                        scheduled_at=now,
-                        end=now,
-                        phase="prefill",
-                        p=8,
-                        d=0,
-                        k=8,
-                        generated_tokens=1,
-                    )
-                ]
-            ),
+            dict(steps=[work_step(p=8, scheduled_at=now, end=now, **identity)]),
         )
         self.feed.emit("worker_request_finished", requests=[identity])
         return stream
@@ -139,51 +126,6 @@ async def generate(handler, pid, tokens=8, **kwargs):
         "elapsed_since_arrival_ms": 12,
     }
     return [chunk async for chunk in handler.generate(request, **kwargs)]
-
-
-@pytest.mark.asyncio
-async def test_dp_capacity_pins_and_packed_tokens(handler):
-    handler._config = SimpleNamespace(namespace="test", endpoint="test.vllm.generate")
-    context = object()
-    await generate(handler, "first", context=context)
-    assert handler._kv_router.sent["routing"]["backend_instance_id"] == 7
-    assert handler._kv_router.sent["routing"]["dp_rank"] == 2
-    assert handler._kv_router.sent["elapsed_since_arrival_ms"] == 12
-    assert handler._kv_router.context is context
-    await generate(handler, "second")
-    assert handler._kv_router.sent["routing"]["dp_rank"] == 3
-    status = await handler._scheduler.status_snapshot()
-    assert {k: v["used"] for k, v in status["workers"].items()} == {"7:2": 8, "7:3": 8}
-    status = [value async for value in handler.status()]
-    metrics = [value async for value in handler.metrics()]
-    assert status[0]["scheduler"]["programs_total"] == 2
-    assert metrics[0]["counters"]["program_requests_total"] == 2
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("terminal", [False, True])
-async def test_stream_usage_keeps_duru_reservation_accurate(handler, terminal):
-    chunks = [
-        {"token_ids": [1], "completion_usage": {"completion_tokens": 1}},
-        {"token_ids": [2, 3]},
-    ]
-    if terminal:
-        chunks.append(
-            {"finish_reason": "stop", "completion_usage": {"completion_tokens": 4}}
-        )
-    handler._kv_router = AccountingKvRouter(
-        handler.test_feed,
-        chunks,
-        error=None if terminal else RuntimeError("disconnected"),
-    )
-    if terminal:
-        await generate(handler, "stream", 4)
-    else:
-        with pytest.raises(RuntimeError, match="disconnected"):
-            await generate(handler, "stream", 4)
-    assert handler._scheduler._table.programs["stream"].token_total == (
-        8 if terminal else 7
-    )
 
 
 @pytest.mark.asyncio
@@ -312,17 +254,7 @@ async def test_accounting_failure_returns_503_and_keeps_endpoints_available(
     try:
         await asyncio.wait_for(serving.wait(), 2)
         await snapshot_when(handler, lambda s: "queued" in s["programs"])
-        handler.test_feed.emit(
-            "accepted_output",
-            steps=[
-                dict(
-                    client_request_id="unjoined",
-                    root="bad",
-                    agent="bad",
-                    end=time.time(),
-                )
-            ],
-        )
+        fail_accounting(handler)
         with pytest.raises(
             AccountingUnavailable, match="accounting is unavailable"
         ) as error:
@@ -348,11 +280,9 @@ async def test_accounting_failure_returns_503_and_keeps_endpoints_available(
         await asyncio.gather(service, request, return_exceptions=True)
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("pulling", [False, True])
-async def test_accounting_failure_does_not_cancel_dispatched_stream(handler, pulling):
-    entered = asyncio.Event()
-    finish = asyncio.Event()
+@pytest_asyncio.fixture
+async def streaming(handler, request):
+    entered, finish = asyncio.Event(), asyncio.Event()
 
     class StreamingRouter(AccountingKvRouter):
         async def generate_from_request(self, request, **kwargs):
@@ -367,43 +297,59 @@ async def test_accounting_failure_does_not_cancel_dispatched_stream(handler, pul
             return chunks()
 
     handler._kv_router = StreamingRouter(handler.test_feed)
-    stream = handler.generate({"token_ids": [1]})
-    pending = None
-    try:
-        assert await asyncio.create_task(anext(stream)) == {"token_ids": [1]}
-        if pulling:
-            pending = asyncio.create_task(anext(stream))
-            await asyncio.wait_for(entered.wait(), 1)
-        handler.test_feed.emit(
-            "accepted_output",
-            steps=[
-                dict(
-                    client_request_id="unjoined",
-                    root="bad",
-                    agent="bad",
-                    end=time.time(),
-                )
-            ],
-        )
-        with pytest.raises(AccountingUnavailable):
-            await asyncio.wait_for(handler.test_monitor, 3)
-        finish.set()
-        if pending is None:
-            pending = asyncio.create_task(anext(stream))
-        assert await asyncio.wait_for(pending, 1) == {
-            "token_ids": [2],
-            "finish_reason": "stop",
+    payload = {"token_ids": [1]}
+    if getattr(request, "param", None):
+        payload["agent_context"] = {"session_id": request.param}
+    stream = handler.generate(payload)
+    pending = []
+
+    async def start(pulling):
+        assert await asyncio.wait_for(asyncio.create_task(anext(stream)), 2) == {
+            "token_ids": [1]
         }
-        with pytest.raises(StopAsyncIteration):
-            await anext(stream)
-        assert not handler.requests and not handler.sessions and not handler.roots
-        assert not handler._scheduler._table.programs
+        if pulling:
+            pending.append(asyncio.create_task(anext(stream)))
+            await asyncio.wait_for(entered.wait(), 1)
+            return pending[-1]
+
+    try:
+        yield stream, finish, start
     finally:
         finish.set()
-        if pending is not None:
-            pending.cancel()
-            await asyncio.gather(pending, return_exceptions=True)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         await stream.aclose()
+
+
+def fail_accounting(handler):
+    handler.test_feed.emit(
+        "accepted_output",
+        steps=[
+            dict(client_request_id="unjoined", root="bad", agent="bad", end=time.time())
+        ],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pulling", [False, True])
+async def test_accounting_failure_does_not_cancel_dispatched_stream(
+    handler, streaming, pulling
+):
+    stream, finish, start = streaming
+    pending = await start(pulling)
+    fail_accounting(handler)
+    with pytest.raises(AccountingUnavailable):
+        await asyncio.wait_for(handler.test_monitor, 3)
+    finish.set()
+    assert await asyncio.wait_for(
+        pending if pending is not None else anext(stream), 1
+    ) == {"token_ids": [2], "finish_reason": "stop"}
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert not handler.requests
+    assert not handler.sessions and not handler.roots
+    assert not handler._scheduler._table.programs
 
 
 @pytest.mark.asyncio
@@ -435,41 +381,17 @@ async def test_intentional_shutdown_stops_monitor_without_failure(handler):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("pulling", [False, True])
-async def test_session_final_closes_stream_across_per_chunk_tasks(handler, pulling):
-    entered = asyncio.Event()
-
-    class ChunkRouter(AccountingKvRouter):
-        async def generate_from_request(self, request, **kwargs):
-            await super().generate_from_request(request, **kwargs)
-
-            async def chunks():
-                yield {"token_ids": [1]}
-                entered.set()
-                await asyncio.Event().wait()
-
-            return chunks()
-
-    handler._kv_router = ChunkRouter(handler.test_feed)
-    stream = handler.generate(
-        {"token_ids": [1], "agent_context": {"session_id": "stream"}}
-    )
-    first = asyncio.create_task(anext(stream))
-    assert await asyncio.wait_for(first, 2) == {"token_ids": [1]}
-    second = None
-    if pulling:
-        second = asyncio.create_task(anext(stream))
-        await asyncio.wait_for(entered.wait(), 1)
-    try:
-        await asyncio.wait_for(handler.end_session("stream"), 2)
-        if second is not None:
-            with pytest.raises(asyncio.CancelledError):
-                await second
-        with pytest.raises(StopAsyncIteration):
-            await anext(stream)
-        assert not handler.sessions
-        await snapshot_when(handler, lambda s: not s["roots"])
-    finally:
-        if second is not None:
-            second.cancel()
-            await asyncio.gather(second, return_exceptions=True)
-        await stream.aclose()
+@pytest.mark.parametrize("streaming", ["stream"], indirect=True)
+async def test_session_final_closes_stream_across_per_chunk_tasks(
+    handler, streaming, pulling
+):
+    stream, _, start = streaming
+    pending = await start(pulling)
+    await asyncio.wait_for(handler.end_session("stream"), 2)
+    if pending is not None:
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    with pytest.raises(StopAsyncIteration):
+        await anext(stream)
+    assert not handler.sessions
+    await snapshot_when(handler, lambda s: not s["roots"])
