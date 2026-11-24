@@ -65,7 +65,7 @@ def test_compact_coordinates_and_clock_ordering(tmp_path):
     assert all(row["time"] <= end for row in rows[:index] if row["event"] == "u_clock")
     assert any(row["event"] == "u_clock" for row in rows[index + 1 :])
     assert tail.sequence == len(rows)
-    assert tail.watermark > end
+    assert tail.received_through > end
 
 
 def test_feed_error_still_closes_writer(tmp_path):

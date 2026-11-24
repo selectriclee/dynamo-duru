@@ -15,6 +15,7 @@ import queue
 import socket
 import struct
 import threading
+from collections import deque
 from multiprocessing.connection import Connection
 from pathlib import Path
 
@@ -42,6 +43,63 @@ def channel_path(logical_path):
             "DURU_IPC_DIR is too long for a Unix socket; use a short local path"
         )
     return path
+
+
+class InProcessChannel:
+    """Ordered router events without a socket or a sender thread.
+
+    Keep Sender's record/byte limits and serialized value snapshots. Closing the
+    producer rejects new records but lets accounting drain the accepted records,
+    including its footer, before the accounting thread stops.
+    """
+
+    def __init__(self, capacity=CAPACITY, max_records=8192, recording=None):
+        self.capacity = capacity
+        self.max_records = max_records
+        self.recording = recording
+        self.pending_bytes = 0
+        self.queue = deque()
+        self.lock = threading.Lock()
+        self.closed = False
+
+    def submit(self, kind, value):
+        if kind != "record":
+            raise ValueError("Unsupported Duru event message: " + kind)
+        frame = pickle.dumps(value, protocol=5)
+        if len(frame) > MAX_FRAME:
+            raise RuntimeError("Duru accounting frame exceeds memory limit")
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("Duru event transport is closed")
+            if self.pending_bytes + len(frame) > self.capacity:
+                raise RuntimeError(
+                    "Duru accounting buffer overflow; scorer must catch up"
+                )
+            if len(self.queue) >= self.max_records:
+                raise RuntimeError("Duru accounting queue overflow")
+            self.queue.append(frame)
+            self.pending_bytes += len(frame)
+        if self.recording is not None:
+            self.recording.submit(kind, value)
+
+    def read(self, budget=4 * 1024 * 1024):
+        frames = []
+        size = 0
+        with self.lock:
+            while self.queue and size < budget:
+                frame = self.queue.popleft()
+                frames.append(frame)
+                size += len(frame)
+            self.pending_bytes -= size
+        return [pickle.loads(frame) for frame in frames]
+
+    def close(self):
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+        if self.recording is not None:
+            self.recording.close()
 
 
 class Sender:

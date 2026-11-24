@@ -1,21 +1,23 @@
-# RFC: Incremental Duru integration with ThunderAgent
+# DEP: Pluggable Duru fairness policy with a ThunderAgent adapter
 
-Status: local draft for review; not filed as a DEP and not an approved interface.
-Proposed area: router, with a separately reviewed vLLM adapter.
+Status: Local DEP draft; not filed on GitHub. Interfaces and PR boundaries are subject to maintainer review.
+Area: router, with a separately reviewed vLLM adapter.
 
 ## Summary
 
-Add Duru as an opt-in fairness policy that reuses ThunderAgent's scheduler.
-ThunderAgent continues to own capacity checks, worker placement, reservations,
-locking, pause/resume execution, and cancellation. Duru supplies queue order and
-eligibility for a capacity exception. A router-owned accounting component computes
-U from request lifecycles and accepted engine work. Engine processes receive the
-latest request scores through local IPC.
+Duru's philosophy is to measure how far each agent or multi-agent task has fallen
+behind its fair share, then use that common signal to coordinate router admission
+and runtime scheduling. This approach can be applied to different serving systems.
 
-The current branch is a working prototype spanning all of these concerns. This
-proposal breaks it into small changes with independent tests and explicit
-dependencies. The first upstream PR should contain only a behavior-preserving
-ThunderAgent refactor. It should not introduce U accounting, IPC, or Duru flags.
+This DEP proposes an opt-in implementation on top of Dynamo's ThunderAgent router
+and vLLM. ThunderAgent and vLLM adapters connect Duru’s fairness policy to the router
+and engine schedulers.
+ThunderAgent continues to own capacity checks, worker placement,
+reservations, locking, pause/resume execution, and cancellation. Duru supplies
+priority and admission-exception eligibility.
+
+This proposal breaks it into small changes with independent tests and explicit
+dependencies.
 
 ## Motivation
 
@@ -24,208 +26,241 @@ requests in arrival order does not directly account for service received across
 an agent's lifetime or across children of the same root. Duru uses accumulated
 entitlement and accepted work to prioritize underserved roots.
 
-The review problem is separate from the scheduling problem: the prototype mixes
-shared scheduler changes, fairness mathematics, engine instrumentation, transport,
-calibration, and deployment wiring. Reviewers should be able to accept or reject
-each mechanism without reviewing the entire implementation at once.
+ThunderAgent is the initial integration target because it already provides
+program-level working-set accounting and admission control. Reusing those
+mechanisms lets us add Duru's fairness decisions without maintaining a second
+implementation of reservation and lifecycle management.
 
 ## Proposal
 
+### General philosophy and this implementation
+
+The accompanying paper, [*Towards Fair Resource Sharing in Agentic LLM Serving*](https://arxiv.org/abs/2611.23558v1),
+defines normalized slowdown relative to ideal processor sharing (§3) and uses it
+as a shared control signal across routing and runtime scheduling (§§5.1–5.5).
+The goal is to reduce disproportionate agent-level delay while limiting throughput
+loss.
+
+**1. Slowdown: how much longer did the agent take under sharing?**
+
+Compare the time an agent spends executing and waiting under sharing with the
+inference time it would need alone:
+
+$$
+S = \frac{T_{\mathrm{shared}} + T_{\mathrm{queue}}}{T_{\mathrm{alone}}}.
+$$
+
+Here, $T_{\mathrm{shared}}$ is execution time under sharing and
+$T_{\mathrm{queue}}$ is waiting time, following the paper's notation. Both
+accumulate across the agent's LLM calls.
+
+**2. Normalize for load: with a fixed number of agents, is that slowdown fair?**
+
+Start with one worker and $N$ competing single-agent tasks, each with an
+outstanding request. Under ideal equal sharing, each receives $1/N$ of the
+worker, so its reference slowdown is $N$. Normalize by that reference:
+
+$$
+U = \frac{S}{N}.
+$$
+
+$U > 1$ identifies an agent that has fallen behind its fair share; $U < 1$ means it has received more.
+
+**3. Let the number of competing agents change over time.**
+
+Agents arrive, finish, and enter tool phases, so there is no single fixed $N$.
+Instead, accumulate the agent's fair share at each instant when it has an
+outstanding request:
+
+$$
+U = \frac{1}{T_{\mathrm{alone}}}
+    \int_{\mathcal{I}} \frac{1}{N(t)}\,dt.
+$$
+
+Here, $\mathcal{I}$ contains the agent's waiting and execution intervals, and
+$N(t)$ counts agents with outstanding requests at time $t$. When $N$ is
+constant, $U$ reduces to $\frac{S}{N}$, recovering
+the previous equation.
+
+**4. Extend to multiple workers and multi-agent tasks.**
+
+With $G(t)$ workers and $N(t)$ competing single-agent tasks, each agent's fair
+share becomes $\min(1, G(t)/N(t))$, capped at one worker:
+
+$$
+U = \frac{1}{T_{\mathrm{alone}}}
+    \int_{\mathcal{I}} \min\!\left(1, \frac{G(t)}{N(t)}\right)\,dt.
+$$
+
+To calculate this score while a task is running, use only the waiting and
+execution intervals observed so far and the estimated standalone cost of
+completed, accepted engine iterations. This requires no prediction of the task's
+future requests or total work.
+
+In the code, `E` accumulates $\int_{\mathcal{I}\cap[0,t]} \min(1, G(\tau)/N(\tau))\,d\tau$ and `W` estimates
+$T_{\mathrm{alone,so\ far}}$, the standalone time for completed, accepted work,
+giving `U = E / W` when `W > 0`.
+We update both incrementally, estimating each completed iteration's standalone
+time from offline points because it cannot be measured directly under sharing.
+
+We call the root agent and its sub-agents working on the same multi-agent task
+an **agent group**. The normalized slowdown for the group is the
+$T_{\mathrm{alone,so\ far}}$-weighted average of its agents' normalized-slowdown
+scores, using the per-agent share defined in step 4.
+
 ### Responsibilities
 
-| Component | Owns | Does not own |
+Components describe runtime responsibilities; PRs describe how we deliver them.
+Some components span multiple PRs.
+
+| Component | Responsibility | PR |
 | --- | --- | --- |
-| ThunderAgent scheduler | Capacity tests, placement, reservations, lifecycle transitions and lock discipline | U calculation or socket transport |
-| Duru policy | Candidate ordering, admission ceiling and exception eligibility | Direct mutation of worker reservations |
-| U accounting | E/W state, accepted-work costs, lifecycle cleanup and fresh snapshots | Native scheduling operations |
-| Event transport | Bounded, ordered delivery of captured measurements | Fairness decisions |
-| Score transport | Latest request scores and observation time for engine processes | U computation or event history |
-| Diagnostics | Optional counters, logs and recordings | Input to scheduling decisions |
+| ThunderAgent adapter | We reuse ThunderAgent's capacity checks, placement, reservations and lifecycle management, and expose hooks for Duru decisions. | 1 |
+| Event collection | Capture router lifecycle events and accepted vLLM work with request and root identities. | 2 |
+| Event and score transport | Deliver ordered events to accounting and fresh score snapshots to engine processes. | 3 |
+| Calibration | Measure and predict standalone execution costs for the deployment configuration. | 4 |
+| U accounting and engine scheduling | Maintain E/W, clean up completed roots, publish scores and prioritize vLLM waiting requests. | 5 |
+| Router ordering and serving integration | Prioritize waiting programs and connect Duru to the public serving path. | 6 |
+| Admission exception | Authorize alpha-based exceptions after normal admission fails; ThunderAgent applies placement and reservation changes. | 7 |
+| Documentation | Explain setup, configuration, architecture and evaluation in the READMEs and guides. | 8 |
+| Diagnostics | Provide optional counters, logs and recordings alongside the components they describe. | 2–3, 5–7 |
 
 The intended data flow is:
 
-```text
-request lifecycle + accepted engine work
-                    |
-             router accounting
-                    |
-          immutable score snapshot
-             /             \
-    direct memory       latest-score IPC
-         |                    |
-  router policy       engine waiting order
+```mermaid
+flowchart LR
+    H["Router events"] -->|"In-process"| A["Duru accounting<br/>in the router process"]
+    E["vLLM engine events"] -->|"IPC"| A
+    C["Calibration"] -->|"Estimated standalone costs"| A
+    A --> S["Normalized slowdown"]
+    S -->|"In-process"| R["ThunderAgent adapter<br/>Router ordering and admission"]
+    S -->|"IPC"| W["vLLM adapter<br/>Engine waiting-queue ordering"]
 ```
 
-Event delivery and score delivery have different contracts. Every accepted-work
-event must be accounted for in order. Score consumers may skip intermediate
-snapshots and keep only the newest one. Combining these into one generic queue
-would obscure this distinction.
+### How the score is calculated
 
-### Accounting contract
+Duru keeps two running totals for each agent group:
 
-For root `r`, `U_r = E_r / W_r`. Entitlement accumulates while that root has
-outstanding requests. With `G` replica equivalents, `N` active roots, and `A_r`
-active agents within a root, its entitlement rate is `min(A_r, G/N)`.
-`W_r` accumulates calibrated costs of accepted engine work. Generated-token
-counts are throughput diagnostics, not the work-cost definition.
+- `E` is the accumulated integral defined above: the worker time the group would
+  have received under fair sharing while its requests were waiting or running.
+  With `G` workers, `N` groups with outstanding requests, and `A` active agents in
+  this group, each elapsed second adds `min(A, G/N)` to `E`. Multiple outstanding
+  requests from the same agent count as one active agent.
+- `W` is the estimated time the group's completed work would have taken alone.
+  When vLLM finishes an engine step and keeps its result, Duru adds that step's
+  estimated standalone cost, using measurements for the same model and serving
+  configuration. Merely scheduling a step does not add to `W`, and discarded
+  results do not count.
 
-The zero-work case uses the existing finite lookahead estimate until measured
-work is available. Invalid costs must not produce an admissible score. Calibration
-must identify the model and serving configuration it describes.
+Once `W > 0`, the score is `U = E / W`. A higher score means the group has fallen
+further behind its fair share, so Duru gives it higher priority.
 
-A common producer watermark aligns entitlement and accepted work. A request
-ending does not mean its root is finished: tool gaps retain accumulated E/W, and
-late engine callbacks still need request identity. Explicit terminal root events
-release retained identities and accounting state after all work is accounted for.
+### Lookahead: scoring a group before its first completed work
 
-### Scheduling contract
+Initially `W = 0`, so `E / W` is undefined. For each waiting request, Duru estimates
+how long its next five engine steps would take alone and temporarily uses:
 
-Candidates are ordered by Duru priority. For each candidate, ThunderAgent first
-tries normal capacity admission. If that fails, the policy may authorize the
-alpha exception; ThunderAgent performs the resulting placement and state changes.
-If neither path admits the candidate, the scheduler considers later candidates
-for capacity backfill.
+$$
+\mathrm{score} = \frac{E}{\text{estimated standalone time for the next five steps}}.
+$$
 
-There is no global pass that forces every eligible candidate before trying normal
-admission. The normal-then-exception check happens per candidate in priority order.
+As soon as the group has completed work with a valid cost, Duru switches to
+`E / W` for every request in that group.
 
-The prototype also changes initial-admission ranking, retries when request state
-changes, timeout forcing, handling of unplaced returning programs, and deferred
-reasoning-phase pauses. These are observable behavior changes. They must be
-reviewed explicitly, not hidden inside a queue-order refactor.
+### Router order and the admission exception
 
-### Runtime contract
+The router tries waiting agents in decreasing score order. Equal scores use
+earlier request arrival first. For each agent, it follows these steps:
 
-The router owns accounting lifecycle and reads immutable snapshots directly.
-Workers refresh a compact score snapshot on a background thread; their scheduler
-callbacks only read memory. Stale, missing, or future-dated snapshots defer new
-admission rather than silently falling back to a different policy.
+1. Ask ThunderAgent whether the request fits within its normal capacity limit.
+   If it fits, admit it.
+2. If it does not fit, check the exception: a waiting request with a fresh, valid
+   score **at least `alpha`** may be admitted beyond that normal limit.
+   This uses the lookahead score before the group's first completed work and
+   `E / W` afterward.
+3. If neither check admits it, leave it waiting and try the next agent. A smaller,
+   lower-scoring request may fit even when the higher-scoring one cannot.
 
-The initial implementation is same-node and targets vLLM 0.33.0 asynchronous,
-non-speculative scheduling. It requires explicit request/program/root identity
-correlation and producer completion notifications. Cross-node transport, scorer
-recovery, speculative decoding, and other engine adapters are separate proposals.
+### Queue order inside vLLM
 
-The public handler owns lifecycle publication and identity injection. Session IDs
-retain accounting across turns; child sessions join an already registered parent.
-Session-final notifications end router reservations. Accounting retains a finished
-root until all descendants have ended and dispatched requests have worker terminal
-acknowledgements, so late accepted callbacks are counted before cleanup.
+After admission, a request may still wait inside vLLM. Duru uses the same scores
+there: within each existing waiting queue, try the highest score first, with
+earlier arrival breaking ties.
 
-Both ingress and worker events consume the same bounded pending-event budget,
-including when a producer stops advancing its watermark. The serving task and
-accounting monitor share a lifetime: an accounting failure rejects new work,
-cancels waiting/in-flight requests, and stops the service endpoints.
+vLLM still checks actual memory availability and decides what can run. Duru does
+not interrupt a running request just because another has a higher score.
 
-## Small PR sequence
+### Keeping the scores current
 
-Each row is a separate review unit, not a promise to merge every proposed
-abstraction. Dependencies indicate code requirements; implementation can proceed
-in parallel where they permit. Each PR gets its own work issue when filed, with
-`Part of #<DEP>` linking the umbrella proposal. No placeholder issue number should
-be submitted as a real reference.
+The score calculation runs in the router process. The router reads its results
+directly, and each engine receives updates in the background, so choosing the
+next request does not wait for a message exchange.
 
-| PR | Single problem and boundary | Dependencies | Acceptance evidence |
+Reports from the router and engines can arrive at different times.  Duru updates `E` and `W` only
+through a time that both the router and engines have finished reporting.
+
+Session IDs connect requests across turns, and child agents identify their parent.
+Ending a session releases its router reservations. Duru keeps the group's totals
+until the root agent and all its sub-agents have ended and workers have confirmed that
+all dispatched requests are finished, so late work reports are counted before
+cleanup. Pending events have a fixed memory limit; exceeding it stops accounting
+instead of silently dropping work. If accounting fails, new requests and requests
+still waiting at the router receive an explicit **503 (service unavailable)
+error**. The router reports that Duru accounting is unavailable and new admissions
+are stopped. It stays up to return errors and report its status. It does not
+cancel requests already sent to an engine
+because of this failure, and session cleanup remains available. It does not
+switch to another scheduling policy. For now, admitting new requests again
+requires resolving the failure and restarting the Duru router.
+
+## Implementation plan: eight PRs
+
+Organize the implementation around seven responsibilities, followed by one documentation PR. Each implementation PR includes its own tests, docstrings, and CLI help.
+| PR | Responsibility | What it does | Depends on |
 | --- | --- | --- | --- |
-| 1 | Extract native resume planning/selection from `thunderagent_router/router.py` into the smallest policy interface. Default implementation exactly preserves native behavior. | None | Native tests plus deterministic before/after traces for queue order, capacity, placement, timeout, tool return and cancellation. No Duru imports. |
-| 2 | Add pure entitlement and accepted-work accounting, including terminal cleanup. Extract `LiveU` from the runtime module. Inject the cost function. | None | Hand-computed E/W/U cases, fanout, tool gaps, invalid costs, late work and root cleanup. No transport or engine imports. |
-| 3 | Add calibration representation and cost prediction. | None | Contract validation, interpolation, boundaries, positive finite costs and out-of-grid behavior. No scheduler changes. |
-| 4 | Add calibration planning/measurement tooling. Keep experiment orchestration outside the runtime package. | 3 | Reproducible point generation and a fake measurement adapter; separately recorded hardware qualification. |
-| 5 | Define typed lifecycle/work observations and implement bounded event delivery. | None | Sequence/watermark ordering, overflow, disconnect, producer closure and bounded buffers. No U-based decisions. |
-| 6 | Capture accepted vLLM work and stable identities using the event contract. | 5 | Callback tests and v0.33.0 integration evidence; native scheduling order unchanged when only observing. |
-| 7 | Own live accounting in the router and join lifecycle/work observations. | 2, 3, 5 | Watermark alignment, invalid joins, failure propagation, cleanup and replay parity. No file-based scorer or standalone scorer process. |
-| 8 | Deliver latest scores to engine processes; move the reader/freshness interface beside score transport. | 5, 7 | Multi-process delivery, immutable decision snapshots, stale/missing scores, reconnect and shutdown. No score-file fallback. |
-| 9 | Add pure Duru ordering and alpha eligibility rules. | None | Score order, tie breaks, first admission, idle programs, pending requests and alpha boundaries. No reservation mutations. |
-| 10 | Add only the scheduler lifecycle extension points Duru needs, with native defaults preserved. Keep each independently useful hook as a separate commit. | 1 | Explicit tests for each opt-in behavior and unchanged native defaults. Review whether each hook is necessary. |
-| 11 | Connect Duru policy and fresh router scores to ThunderAgent admission. | 7, 9, 10 | Normal fit before exception, highest-U ordering, backfill, cancellation races and stale-score deferral. |
-| 12 | Add engine waiting-queue ordering as an opt-in adapter. | 6, 8 | Fresh known requests only, decision consistency, native mode parity and asynchronous scheduler tests. |
-| 13 | Wire the public entrypoint and configuration for the first supported topology. | 11, 12 | One complete serving smoke test, validated calibration contract and clean startup/shutdown. |
-| 14 | Add optional diagnostics, recordings, documentation and a reproducible evaluation recipe. Separate diagnostics from the recipe if the diff grows. | 13 | Logging-off behavior, bounded live state, log overhead measurement and valid matched benchmark results. |
+| 1 | ThunderAgent adapter | Define the boundary between Duru decisions and ThunderAgent mechanisms. Extract the minimum extension points for policy decisions and lifecycle observation, including reusable serving startup in `thunderagent_router/__main__.py` and CLI argument configuration in `thunderagent_router/args.py`. ThunderAgent retains capacity checks, worker placement, reservations, locking, pause/resume and cancellation. Preserve native defaults; introduce no Duru decisions. | None |
+| 2 | Event collection | Define observations and capture request start/end, program/root identity, accepted engine work, and worker completion. Use an injected event sink so callback semantics can be tested without IPC. Observe native execution without changing queue order. | 1 |
+| 3 | Transport | Connect producers and consumers across local processes. Deliver work events through bounded ordered channels, and deliver score snapshots through a separate latest-value channel. Include readers, freshness metadata, producer progress, shutdown and failure reporting. Test with synthetic events/scores; do not depend on the accounting implementation. | 2 |
+| 4 | Calibration | Define the model/configuration-specific calibration artifact, measure solo work costs, and predict the cost of accepted work. Include planning and measurement tools, interpolation and contract validation. Keep measurement orchestration separate from the runtime predictor. | None |
+| 5 | Duru runtime and engine scheduler | Consume observations, compute entitlement E and accepted work W, derive U, retain state through tool gaps, and release completed roots only after all work is accounted for. Publish fresh snapshots and use them to order waiting requests inside vLLM. Include background lifecycle, failure supervision and runtime diagnostics. | 2, 3, 4 |
+| 6 | Router ordering and serving integration | Use the runtime's fresh scores to order programs waiting for ThunderAgent admission, including first admission and capacity backfill. Add the opt-in public entrypoint, configuration, identity/lifecycle wiring and CLI help. Keep the alpha exception disabled in this PR. | 1, 5 |
+| 7 | Admission exception | After a candidate's normal router capacity check fails, permit the alpha-based exception when its fresh valid score qualifies. ThunderAgent still owns placement and reservation changes; the engine still requires real KV space. Complete alpha configuration and matched end-to-end evaluation. | 6 |
+| 8 | Documentation | Add the Duru and calibration READMEs, architecture explanation, setup and configuration guide, supported-topology limitations, and evaluation instructions for the completed implementation. | 7 |
 
-PRs 5 and 6 should remain small enough to review independently: one establishes
-delivery semantics, the other establishes what engine callbacks mean. PRs 11 and
-12 likewise separate router admission from engine scheduling. A runtime-only
-change should not require reviewers to understand the benchmark harness.
-
-The existing prototype must be split into this sequence on a clean branch; these
-PRs do not exist yet. A single large feature commit followed by cleanup commits
-does not provide the intended review boundaries. Reconstruct the series against
-the agreed upstream base, and run each PR's tests at its own tip.
-
-## Immediate refactor scope
-
-The current cleanup removes file-based live scoring and its standalone CLI.
-Recorded-input replay remains a test helper, and optional diagnostic recording
-remains available. This is one change, separate from renaming modules, moving the
-score reader, extracting the pure accounting model, or redesigning policy hooks.
-
-The follow-up cleanup reuses ThunderAgent's CLI configuration, removes unused
-scheduled-work notifications, and gives each policy an explicit local score
-reader. Accepted-work accounting, completion acknowledgements, and the three Duru
-behavior overrides remain unchanged. Detailed root snapshots are optional.
-CPU replay of saved engine events checks accounting and policy decisions across
-the cleanup; it does not establish new GPU throughput measurements.
-
-Extracting pure accounting or moving `Reader` alongside score transport remain
-separate changes requiring their own tests and review diffs.
+For example, a request completes a prefill step. Collection reports the accepted
+work; transport delivers it; calibration estimates its cost; the runtime updates
+that root's U. The router uses the resulting scores to order admissions. If a
+candidate cannot fit normally, the exception rule may authorize admission. Once
+requests are inside vLLM, Duru's normalized slowdown based ordering chooses which one to try
+next, while native memory allocation remains authoritative.
 
 ## Requirements and validation
 
-- Native ThunderAgent behavior MUST remain unchanged with Duru disabled.
-- ThunderAgent MUST own capacity checks and state transitions under its lock.
-- Live accounting MUST NOT depend on JSONL recordings or a score file.
-- Accepted-work delivery MUST fail visibly on gaps or overflow; dropping work
-  would change U. Score delivery MAY discard intermediate snapshots.
-- Storage MUST have explicit caps, and root completion MUST release retained
-  state. Total accounting state scales with outstanding roots and identities;
-  it is not constant memory independent of workload concurrency.
-- Diagnostic output MUST be optional and MUST NOT determine scheduling outcomes.
-- Validation MUST distinguish mathematical tests, transport/replay parity, engine
-  compatibility, and end-to-end performance. Passing one does not establish another.
-- The experiment MUST reuse unchanged baselines and calibration only with recorded
-  provenance and matching contracts. A runtime refactor need not restart an
-  already-running experiment that uses immutable source.
+- Keep Duru's score calculation and scheduling rules separate from system-specific adapters.
+- Preserve ThunderAgent's behavior when Duru is disabled, and reuse its capacity checks and state management.
+- Report missing work events as errors, limit memory use, and release completed agent groups.
+- Keep logging optional; scheduling must work without log or score files.
 
-A preliminary matched TraceLab run with 500 completed roots per method measured
-p99 U of 1.759 for native ThunderAgent and 0.859 for Duru, with throughput of 3,270
-and 2,995 tokens/s respectively. This is a fairness improvement with an 8.4%
-throughput cost for this single point, not evidence of universal improvement.
-Live accounting passed comparison with recorded events across 2,136 snapshots.
-Broader workload results and measurements with diagnostics disabled remain needed
-before making performance claims about the final upstream implementation.
+Test score calculation, event delivery, and scheduling; compare fairness, throughput,
+and latency against unchanged baselines under the same workload and serving setup.
 
-## Alternatives
+## Alternate Solutions
 
 - Keep a separate Duru scheduler: avoids shared hooks but duplicates capacity and
   lifecycle logic, increasing the chance that fixes diverge.
-- Keep a standalone scorer and file snapshots: makes offline inspection easy but
-  adds a runtime process, file I/O and a second live-accounting path.
-- Merge all transport into scoring: reduces file count but mixes accounting
-  correctness with socket lifecycle and two distinct delivery contracts.
 - Change engine order only: smaller integration, but cannot prioritize programs
   waiting for admission at the router.
 
 ## Open review questions
 
 1. Which policy/lifecycle hooks belong in ThunderAgent, and which should stay in
-   the Duru adapter? In particular, review timeout and deferred-pause behavior.
+   the Duru adapter?
 2. Is same-node IPC an acceptable initial scope, or is cross-node delivery a
    requirement before upstream integration?
-3. What existing request lifecycle interface should provide program/root identity
-   and terminal notifications outside the experimental replay harness?
-4. Should engine score distribution use an existing runtime channel rather than
-   a dedicated Unix socket? Resolve ownership and boundedness before replacing it.
-5. What benchmark coverage and acceptable throughput tradeoff are required before
-   enabling or recommending this policy?
+3. What benchmark coverage and acceptable throughput tradeoff are required?
 
 ## References
 
-- Local implementation: [README](README.md), [accounting](scoring.py),
-  [admission rules](admission.py), [router adapter](router.py),
-  [engine adapter](worker.py), [event and score IPC](transport.py).
-- Repository proposal format: `.github/ISSUE_TEMPLATE/dep.yml`.
-- Maintainer feedback supplied by the author: break the work into the smallest
-  practical mergeable changes and file an RFC. No discussion URL was supplied.
-- Local experiment provenance: campaign 539776, attempt 032; TraceLab native
-  baseline reused from attempt 031. Results are preliminary and not a substitute
-  for testing the eventual upstream PR series.
+- [*Towards Fair Resource Sharing in Agentic LLM Serving*](https://arxiv.org/abs/2611.23558v1), arXiv:2611.23558v1: §3 for normalized/live slowdown and calibration; §§5.1–5.5 for the control signal, coordinated ordering, and admission exceptions; §5.6 for autoscaling, which is outside this DEP.
+- [Dynamo contribution guidance](https://github.com/ai-dynamo/dynamo/blob/main/CONTRIBUTING.md)
+- [Dynamo DEP template](https://github.com/ai-dynamo/dynamo/blob/main/.github/ISSUE_TEMPLATE/dep.yml)

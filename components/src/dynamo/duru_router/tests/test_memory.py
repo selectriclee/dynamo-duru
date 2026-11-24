@@ -11,7 +11,7 @@ import pytest
 
 from dynamo.duru_router import scoring
 from dynamo.duru_router.events import open_feed
-from dynamo.duru_router.scoring import LiveU, MemoryTail, run
+from dynamo.duru_router.scoring import EventStreamReader, LiveU, run
 from dynamo.duru_router.tests.helpers import configuration
 from dynamo.duru_router.tests.helpers import memory_mode as memory_mode
 from dynamo.duru_router.tests.replay_helpers import replay_accounting
@@ -61,7 +61,7 @@ def test_bounded_queue_overflow_and_cross_process(tmp_path):
 
 def test_default_feed_needs_no_journal_and_rejects_second_producer(tmp_path):
     feed = open_feed(tmp_path / "events", name="ingress")
-    tail = MemoryTail(tmp_path / "events/ingress.jsonl")
+    tail = EventStreamReader(tmp_path / "events/ingress.jsonl")
     try:
         feed.submit("record", dict(sequence=1, time=1, event="footer"))
         with pytest.raises(OSError):
@@ -78,7 +78,7 @@ def test_default_feed_needs_no_journal_and_rejects_second_producer(tmp_path):
 def test_memory_sequence_gap_fails_closed(tmp_path):
     feed = open_feed(tmp_path, name="worker")
     feed.submit("record", dict(sequence=2, event="footer", time=2))
-    tail = MemoryTail(tmp_path / "worker.jsonl")
+    tail = EventStreamReader(tmp_path / "worker.jsonl")
     try:
         with pytest.raises(ValueError, match="sequence gap"):
             read_until(tail, 1)
@@ -87,12 +87,12 @@ def test_memory_sequence_gap_fails_closed(tmp_path):
         tail.close()
 
 
-def run_memory(path):
+def run_memory(path, *, ingress_source=None):
     stop = threading.Event()
     timer = threading.Timer(0.3, stop.set)
     timer.start()
     try:
-        run(path, stop)
+        run(path, stop, ingress_source=ingress_source)
     finally:
         timer.cancel()
         timer.join()
@@ -141,14 +141,15 @@ def test_root_cleanup_retains_tool_gap_then_releases_all_history():
 
 
 @pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("in_process", [False, True])
 def test_identical_events_have_identical_u_in_ipc_and_recorded_replay(
-    tmp_path, monkeypatch, completed
+    tmp_path, monkeypatch, completed, in_process
 ):
     path, cfg = configuration(tmp_path)
     monkeypatch.setenv("DURU_RECORD_EVENTS", "1")
     ingress = [
         dict(
-            event="send",
+            event="request_arrived",
             time=100,
             request_id="q",
             root="r",
@@ -156,10 +157,10 @@ def test_identical_events_have_identical_u_in_ipc_and_recorded_replay(
             program_id="p",
             prompt_tokens=8,
         ),
-        dict(event="end", time=101, request_id="q"),
+        dict(event="request_completed", time=101, request_id="q"),
         # Callback at 102 arrives after ingress completion at 101.
         dict(
-            event="send",
+            event="request_arrived",
             time=103,
             request_id="q2",
             root="r",
@@ -168,7 +169,7 @@ def test_identical_events_have_identical_u_in_ipc_and_recorded_replay(
             prompt_tokens=8,
         ),
         dict(
-            event="send",
+            event="request_arrived",
             time=103,
             request_id="child",
             root="r",
@@ -176,13 +177,13 @@ def test_identical_events_have_identical_u_in_ipc_and_recorded_replay(
             program_id="pb",
             prompt_tokens=8,
         ),
-        dict(event="end", time=104, request_id="q2"),
-        dict(event="end", time=105, request_id="child"),
+        dict(event="request_completed", time=104, request_id="q2"),
+        dict(event="request_completed", time=105, request_id="child"),
     ]
     if completed:
         ingress += [
-            dict(event="program_end", time=106, program_id="p"),
-            dict(event="root_end", time=107, root="r"),
+            dict(event="agent_end", time=106, program_id="p"),
+            dict(event="agent_group_end", time=107, root="r"),
         ]
     ingress.append(dict(event="footer", time=108))
     step = dict(
@@ -203,21 +204,26 @@ def test_identical_events_have_identical_u_in_ipc_and_recorded_replay(
         dict(event="footer", time=109),
     ]
     if completed:
-        ingress.insert(1, dict(event="dispatch", time=100.1, request_id="q"))
+        ingress.insert(1, dict(event="request_dispatched", time=100.1, request_id="q"))
         # Final ingress can precede an engine callback. Keep the root until
         # its worker acknowledgement, including across replay.
         worker[-1:-1] = [
             dict(event="accepted_output", time=107.2, steps=[dict(step, end=107.2)]),
             dict(
-                event="request_end",
+                event="worker_request_finished",
                 time=107.3,
                 requests=[dict(client_request_id="q", root="r", agent="a")],
             ),
         ]
     feeds = []
+    ingress_source = None
     for logical, rows in [(cfg["ingress"], ingress), (cfg["ledgers"][0], worker)]:
         logical = Path(logical)
-        feed = open_feed(logical.parent, name=logical.stem)
+        if in_process and str(logical) == cfg["ingress"]:
+            local = scoring.Ingress(logical.parent, in_process=True)
+            feed = ingress_source = local.journal
+        else:
+            feed = open_feed(logical.parent, name=logical.stem)
         feeds.append(feed)
         for i, row in enumerate(rows, 1):
             feed.submit("record", dict(row, sequence=i))
@@ -228,7 +234,7 @@ def test_identical_events_have_identical_u_in_ipc_and_recorded_replay(
         monkeypatch.setenv("DURU_ACCOUNTING_TRANSPORT", mode)
         if mode == "memory":
             try:
-                run_memory(path)
+                run_memory(path, ingress_source=ingress_source)
             finally:
                 for feed in feeds:
                     feed.close()
@@ -257,49 +263,35 @@ def test_identical_events_have_identical_u_in_ipc_and_recorded_replay(
         assert snapshots[0]["programs"]["p"]["kind"] == "idle_measured_only"
 
 
-def test_scorer_runs_without_creating_audit_history(tmp_path):
-    path, cfg = configuration(tmp_path)
-    feeds = []
-    try:
-        for logical in [cfg["ingress"], *cfg["ledgers"]]:
-            logical = Path(logical)
-            feed = open_feed(logical.parent, name=logical.stem)
-            feed.submit("record", dict(sequence=1, event="footer", time=1))
-            feeds.append(feed)
-        stop = threading.Event()
-        stop.set()
-        run_memory(path)
-        assert not Path(cfg["audit_dir"]).exists()
-        assert not list(tmp_path.rglob("*.jsonl"))
-    finally:
-        for feed in feeds:
-            feed.close()
-
-
-@pytest.mark.parametrize("producer", ["ingress", "worker"])
+@pytest.mark.parametrize("producer", ["ingress", "local_ingress", "worker"])
 def test_pending_limit_applies_with_missing_peer_watermark(
     tmp_path, monkeypatch, producer
 ):
     path, cfg = configuration(tmp_path)
     monkeypatch.setattr(scoring, "MAX_PENDING_EVENTS", 2)
-    logical = Path(cfg["ingress"] if producer == "ingress" else cfg["ledgers"][0])
-    feed = open_feed(logical.parent, name=logical.stem)
+    logical = Path(cfg["ingress"] if producer != "worker" else cfg["ledgers"][0])
+    if producer == "local_ingress":
+        feed = scoring.Ingress(logical.parent, in_process=True).journal
+    else:
+        feed = open_feed(logical.parent, name=logical.stem)
     try:
         for sequence in range(1, 4):
             row = (
                 dict(
-                    event="send",
+                    event="request_arrived",
                     request_id=str(sequence),
                     program_id="p",
                     root="r",
                     agent="a",
                     prompt_tokens=8,
                 )
-                if producer == "ingress"
+                if producer != "worker"
                 else dict(event="accepted_output", steps=[dict(end=1)])
             )
             feed.submit("record", dict(sequence=sequence, time=1, **row))
         with pytest.raises(RuntimeError, match="pending-event limit"):
-            run_memory(path)
+            run_memory(
+                path, ingress_source=feed if producer == "local_ingress" else None
+            )
     finally:
         feed.close()

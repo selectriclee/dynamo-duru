@@ -13,7 +13,7 @@ class Tail:
         self.path = Path(path)
         self.offset = 0
         self.sequence = 0
-        self.watermark = 0.0
+        self.received_through = 0.0
         self.closed = False
 
     def read(self):
@@ -39,7 +39,7 @@ class Tail:
                     self.path,
                     self.sequence,
                 )
-                self.watermark = max(self.watermark, r["time"])
+                self.received_through = max(self.received_through, r["time"])
                 result.append(r)
             self.offset = f.tell()
         return result
@@ -48,9 +48,9 @@ class Tail:
         pass
 
 
-def replay_accounting(config, stop=None, *, publish=None):
+def replay_accounting(config, stop=None, *, router_publish=None):
     with (
-        patch.object(scoring, "MemoryTail", Tail),
+        patch.object(scoring, "EventStreamReader", Tail),
         patch.dict(os.environ, DURU_ACCOUNTING_TRANSPORT="memory"),
     ):
-        scoring.run(config, stop, publish=publish)
+        scoring.run(config, stop, router_publish=router_publish)

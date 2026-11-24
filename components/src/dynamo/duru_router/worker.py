@@ -176,7 +176,7 @@ class DuruScheduler(AsyncScheduler):
                 if acceptance[rid][0] and request.is_finished()
             ]
             if finished:
-                self.compact_feed.emit("request_end", requests=finished)
+                self.compact_feed.emit("worker_request_finished", requests=finished)
             return result
 
     def finish_requests(self, *args, **kwargs):
@@ -186,7 +186,8 @@ class DuruScheduler(AsyncScheduler):
             finished = super().finish_requests(*args, **kwargs)
             if finished:
                 self.compact_feed.emit(
-                    "request_end", requests=[self.identity(r) for r in finished]
+                    "worker_request_finished",
+                    requests=[self.identity(r) for r in finished],
                 )
             return finished
 

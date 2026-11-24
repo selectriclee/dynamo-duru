@@ -110,7 +110,6 @@ class TestUCalculation(unittest.TestCase):
         self.assertIsNone(b.score("a")["U"])
         self.assertEqual(b.score("a")["lookahead_s"], 6.0)
         self.assertEqual(b.score("a")["score"], 1.0)
-        self.assertEqual(b.score("a")["score"], 1.0)
         self.assertEqual(b.score("a")["kind"], "zero_work_root_next_five")
 
     def test_new_child_uses_root_measured_work(self):
@@ -227,7 +226,7 @@ def read_rows(path):
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def send_record(
+def arrival_record(
     time=100,
     request_id="req",
     program_id="native/session",
@@ -237,7 +236,7 @@ def send_record(
 ):
     return dict(
         time=time,
-        event="send",
+        event="request_arrived",
         request_id=request_id,
         program_id=program_id,
         prompt_tokens=8,
@@ -255,8 +254,8 @@ def config(tmp_path):
 def records(config):
     _, cfg = config
     ingress = [
-        send_record(),
-        dict(time=100.4, event="end", request_id="req"),
+        arrival_record(),
+        dict(time=100.4, event="request_completed", request_id="req"),
         dict(time=100.5, event="footer"),
     ]
     step = work_step(p=8, client_request_id="req", scheduled_at=100.1, end=100.2)
@@ -335,11 +334,12 @@ class TestScoringService:
             ingress[0].pop("program_id")
         elif case == "changed_program":
             ingress.insert(
-                -1, send_record(100.45, "next", root="other-root", agent="other-agent")
+                -1,
+                arrival_record(100.45, "next", root="other-root", agent="other-agent"),
             )
         else:
             arrival = 100.15 if case == "reuse_active" else 100.45
-            ingress.append(send_record(arrival))
+            ingress.append(arrival_record(arrival))
             ingress.sort(key=lambda row: row["time"])
         write_rows(Path(cfg["ingress"]), ingress)
         with pytest.raises(ValueError, match=message):
@@ -369,8 +369,8 @@ class TestScoringService:
         cfg = config[1]
         ingress, _ = records
         ingress[-1:-1] = [
-            send_record(100.45, "next", "other-session"),
-            send_record(100.46, "parallel", "parallel-session"),
+            arrival_record(100.45, "next", "other-session"),
+            arrival_record(100.46, "parallel", "parallel-session"),
         ]
         write_rows(Path(cfg["ingress"]), ingress)
         snapshot = run_once(config)["last_snapshot"]
@@ -394,13 +394,13 @@ class TestScoringService:
         self, tmp_path, bad_id
     ):
         ingress = Ingress(tmp_path)
-        fields = send_record()
+        fields = arrival_record()
         fields.pop("event")
         fields.pop("time")
         try:
             with pytest.raises(ValueError, match="program_id"):
-                ingress.emit("send", 1, **dict(fields, program_id=bad_id))
-            ingress.emit("send", 2, **fields, unrelated="ignored")
+                ingress.emit("request_arrived", 1, **dict(fields, program_id=bad_id))
+            ingress.emit("request_arrived", 2, **fields, unrelated="ignored")
         finally:
             ingress.close()
         journal = tmp_path / "duru-ingress.jsonl"
@@ -409,7 +409,7 @@ class TestScoringService:
         assert rows[0]["sequence"] == 1
         assert rows[0]["program_id"] == "native/session"
         assert "unrelated" not in rows[0]
-        assert [row["event"] for row in rows] == ["send", "footer"]
+        assert [row["event"] for row in rows] == ["request_arrived", "footer"]
         with pytest.raises(FileExistsError):
             Ingress(tmp_path)
         assert journal.read_bytes() == original

@@ -249,7 +249,7 @@ def test_coordinates_and_accepted_work(
     )
     if finished:
         assert scheduler.compact_feed.events[-1] == (
-            "request_end",
+            "worker_request_finished",
             {"requests": [scheduler.identity(request)]},
         )
     assert accepted["accepted"] and accepted["generated_tokens"] == tokens
@@ -342,7 +342,7 @@ def test_abort_acknowledges_native_removal_before_stale_output(scheduler, batch)
     request = scheduler.requests["r"]
     assert scheduler.finish_requests(["r"]) == [request]
     assert scheduler.compact_feed.events[-1] == (
-        "request_end",
+        "worker_request_finished",
         {"requests": [scheduler.identity(request)]},
     )
     scheduler.update_from_output(batch, output())

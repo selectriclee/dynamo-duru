@@ -17,6 +17,7 @@ import pytest
 from dynamo.duru_router import __main__ as main_module
 from dynamo.duru_router.__main__ import DuruRouterHandler
 from dynamo.duru_router.events import CompactFeed
+from dynamo.duru_router.handler import AccountingUnavailable
 from dynamo.duru_router.router import ThunderAgentConfig
 from dynamo.duru_router.scoring import Ingress, RouterAccounting
 from dynamo.duru_router.tests.helpers import configuration
@@ -58,7 +59,7 @@ class AccountingKvRouter(FakeKvRouter):
                 ]
             ),
         )
-        self.feed.emit("request_end", requests=[identity])
+        self.feed.emit("worker_request_finished", requests=[identity])
         return stream
 
 
@@ -68,9 +69,9 @@ async def handler(monkeypatch, tmp_path):
     monkeypatch.setenv("DURU_DIAGNOSTICS", "1")
     monkeypatch.delenv("DURU_ADMISSION_ALPHA", raising=False)
     monkeypatch.setenv("DURU_SCORES", cfg["scores"])
-    ingress = Ingress(Path(cfg["ingress"]).parent)
+    ingress = Ingress(Path(cfg["ingress"]).parent, in_process=True)
     feed = CompactFeed(Path(cfg["ledgers"][0]).parent)
-    owner = RouterAccounting(path).start()
+    owner = RouterAccounting(path, ingress=ingress).start()
     capacities = {(7, 2): 10, (7, 3): 10}
     capacity = SimpleNamespace(snapshot=lambda: capacities, live_worker_ids=lambda: {7})
     result = DuruRouterHandler(
@@ -104,16 +105,22 @@ async def handler(monkeypatch, tmp_path):
             asyncio.to_thread(feed.close),
             return_exceptions=True,
         )
+        # Closing joins the accounting thread before inspecting its error. The
+        # monitor can notice a closed event channel while that thread is still
+        # finishing its cleanup and has not published the underlying failure.
+        (owner_result,) = await asyncio.gather(
+            asyncio.to_thread(owner.close), return_exceptions=True
+        )
         if owner._error is not None:
             # Fault injection disconnects the producers; they may observe it
             # either on their next heartbeat or during their final flush.
             for result in results:
                 assert result is None or isinstance(result, RuntimeError)
-            with pytest.raises(RuntimeError, match="accounting failed"):
-                await asyncio.to_thread(owner.close)
+            assert isinstance(owner_result, RuntimeError)
+            assert "accounting failed" in str(owner_result)
         else:
             assert results == [None, None]
-            await asyncio.to_thread(owner.close)
+            assert owner_result is None
 
 
 async def snapshot_when(handler, predicate):
@@ -210,7 +217,7 @@ async def test_paused_request_never_dispatches_after_termination(
         await asyncio.gather(request, return_exceptions=True)
 
 
-def test_main_uses_duru_configuration_without_control_port(monkeypatch, tmp_path):
+def test_main_parses_alpha_and_forwards_router_arguments(monkeypatch, tmp_path):
     monkeypatch.setenv("DURU_SCORES", str(tmp_path / "scores.json"))
     monkeypatch.setenv("DURU_ACCOUNTING_CONFIG", str(tmp_path / "scoring.json"))
     monkeypatch.delenv("DURU_ADMISSION_ALPHA", raising=False)
@@ -277,7 +284,7 @@ async def test_anonymous_request_releases_accounting_without_session_final(handl
     assert not handler.sessions
 
 
-async def test_accounting_failure_cancels_queued_work_and_stops_service(
+async def test_accounting_failure_returns_503_and_keeps_endpoints_available(
     handler, monkeypatch
 ):
     serving = asyncio.Event()
@@ -310,19 +317,105 @@ async def test_accounting_failure_cancels_queued_work_and_stops_service(
                 )
             ],
         )
-        with pytest.raises(RuntimeError, match="accounting failed"):
-            await asyncio.wait_for(service, 3)
-        with pytest.raises(RuntimeError, match="accounting failed during request"):
+        with pytest.raises(
+            AccountingUnavailable, match="accounting is unavailable"
+        ) as error:
             await asyncio.wait_for(request, 3)
-        assert stopped.is_set()
+        assert error.value.code == 503
+        assert not stopped.is_set()
+        assert not service.done()
         assert handler._kv_router.sent is None
         assert [s async for s in handler.status()][0]["status"] == "unhealthy"
-        with pytest.raises(RuntimeError):
+        with pytest.raises(AccountingUnavailable) as error:
             await generate(handler, "new")
+        assert error.value.code == 503
+        assert not handler.requests
+        assert not handler._scheduler._admission_gates
+        # Session cleanup remains available even though generation is unavailable.
+        final = {"agent_context": {"session_id": "queued", "session_final": True}}
+        assert [chunk async for chunk in handler.generate(final)] == []
+        assert not handler.sessions and not handler.roots
+        assert not handler._scheduler._table.programs
     finally:
         service.cancel()
         request.cancel()
         await asyncio.gather(service, request, return_exceptions=True)
+
+
+@pytest.mark.parametrize("pulling", [False, True])
+async def test_accounting_failure_does_not_cancel_dispatched_stream(handler, pulling):
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+
+    class StreamingRouter(AccountingKvRouter):
+        async def generate_from_request(self, request, **kwargs):
+            await super().generate_from_request(request, **kwargs)
+
+            async def chunks():
+                yield {"token_ids": [1]}
+                entered.set()
+                await finish.wait()
+                yield {"token_ids": [2], "finish_reason": "stop"}
+
+            return chunks()
+
+    handler._kv_router = StreamingRouter(handler.test_feed)
+    stream = handler.generate({"token_ids": [1]})
+    pending = None
+    try:
+        assert await asyncio.create_task(anext(stream)) == {"token_ids": [1]}
+        if pulling:
+            pending = asyncio.create_task(anext(stream))
+            await asyncio.wait_for(entered.wait(), 1)
+        handler.test_feed.emit(
+            "accepted_output",
+            steps=[
+                dict(
+                    client_request_id="unjoined",
+                    root="bad",
+                    agent="bad",
+                    end=time.time(),
+                )
+            ],
+        )
+        with pytest.raises(AccountingUnavailable):
+            await asyncio.wait_for(handler.test_monitor, 3)
+        finish.set()
+        if pending is None:
+            pending = asyncio.create_task(anext(stream))
+        assert await asyncio.wait_for(pending, 1) == {
+            "token_ids": [2],
+            "finish_reason": "stop",
+        }
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        assert not handler.requests and not handler.sessions and not handler.roots
+        assert not handler._scheduler._table.programs
+    finally:
+        finish.set()
+        if pending is not None:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        await stream.aclose()
+
+
+async def test_ingress_failure_returns_503_before_dispatch(handler, monkeypatch):
+    original = handler.ingress.emit
+
+    def emit(event, *args, **kwargs):
+        if event == "request_arrived":
+            raise RuntimeError("Duru accounting queue overflow")
+        return original(event, *args, **kwargs)
+
+    monkeypatch.setattr(handler.ingress, "emit", emit)
+    with pytest.raises(AccountingUnavailable) as error:
+        await generate(handler, "overflow")
+    assert error.value.code == 503
+    assert handler.failure is not None
+    assert handler._kv_router.sent is None
+    assert not handler.requests
+    with pytest.raises(AccountingUnavailable):
+        await generate(handler, "next")
 
 
 async def test_intentional_shutdown_stops_monitor_without_failure(handler):

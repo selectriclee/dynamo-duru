@@ -1,6 +1,6 @@
-"""Calculate live U from bounded IPC, with optional diagnostic recordings.
+"""Calculate live U from local router events and worker IPC.
 
-A common producer watermark keeps entitlement and accepted work at the same
+A common observation cutoff keeps entitlement and accepted work at the same
 observation time. Recorded events are for diagnostics and offline validation only.
 """
 
@@ -23,6 +23,7 @@ from dynamo.duru_router.calibration.predict import predict
 from dynamo.duru_router.diagnostics import PerformanceLogger
 from dynamo.duru_router.events import open_feed, open_journal
 from dynamo.duru_router.transport import (
+    InProcessChannel,
     Receiver,
     ScorePublisher,
     ScoreSubscriber,
@@ -227,15 +228,19 @@ class Reader:
         self.snapshot = {}
 
 
-class MemoryTail:
-    """Consume one ordered IPC event stream through its terminal watermark."""
+class EventStreamReader:
+    """Read ordered local or IPC events and track producer progress.
 
-    def __init__(self, path):
+    received_through is the latest received event/clock timestamp. Ordered
+    delivery lets accounting use it as this source's safe observation cutoff.
+    """
+
+    def __init__(self, path, *, receiver=None):
         self.path = Path(path)
         self.sequence = 0
-        self.watermark = 0.0
+        self.received_through = 0.0
         self.closed = False
-        self.receiver = None
+        self.receiver = receiver
 
     def read(self):
         if self.closed:
@@ -248,9 +253,9 @@ class MemoryTail:
         rows = self.receiver.read()
         for row in rows:
             if self.closed or row["sequence"] != self.sequence + 1:
-                raise ValueError("Duru memory feed sequence gap or event after footer")
+                raise ValueError("Duru event stream sequence gap or event after footer")
             self.sequence += 1
-            self.watermark = max(self.watermark, row["time"])
+            self.received_through = max(self.received_through, row["time"])
             self.closed = row["event"] == "footer"
         return rows
 
@@ -262,35 +267,44 @@ class MemoryTail:
 def _program_id(fields):
     program_id = fields.get("program_id")
     if not isinstance(program_id, str) or not program_id:
-        raise ValueError("Ingress send requires a nonempty program_id")
+        raise ValueError("Request arrival requires a nonempty program_id")
     return program_id
 
 
 class Ingress:
     """Publish request lifecycle events with explicit router program identity."""
 
-    def __init__(self, path):
-        self.journal = open_feed(path, name="duru-ingress")
+    def __init__(self, path, *, in_process=False):
+        if in_process:
+            recording = (
+                open_journal(path, name="duru-ingress")
+                if os.environ.get("DURU_RECORD_EVENTS") == "1"
+                else None
+            )
+            self.journal = InProcessChannel(recording=recording)
+        else:
+            # Retain the external-producer path for standalone/replay harnesses.
+            self.journal = open_feed(path, name="duru-ingress")
         self.sequence = 0
 
     def emit(self, event, timestamp, **fields):
         if event not in (
-            "send",
-            "dispatch",
-            "end",
-            "cancel",
-            "error",
-            "program_end",
-            "root_end",
+            "request_arrived",
+            "request_dispatched",
+            "request_completed",
+            "request_cancelled",
+            "request_failed",
+            "agent_end",
+            "agent_group_end",
             "u_clock",
             "footer",
         ):
             return
-        if event == "send":
+        if event == "request_arrived":
             _program_id(fields)
         keys = (
             ("request_id", "program_id", "root", "agent", "prompt_tokens")
-            if event == "send"
+            if event == "request_arrived"
             else ("request_id", "program_id", "root")
         )
         self.sequence += 1
@@ -311,7 +325,7 @@ class Ingress:
             self.journal.close()
 
 
-def run(config, stop=None, *, publish=None):
+def run(config, stop=None, *, router_publish=None, ingress_source=None):
     if transport() != "memory":
         raise ValueError(
             "Live U accounting requires IPC (DURU_ACCOUNTING_TRANSPORT=memory)"
@@ -326,7 +340,12 @@ def run(config, stop=None, *, publish=None):
     book = LiveU(
         cfg["capacity"], load_calibration(cfg["calibration"], cfg["runtime_contract"])
     )
-    sources = [MemoryTail(cfg["ingress"])] + [MemoryTail(p) for p in cfg["ledgers"]]
+    ingress_reader = (
+        EventStreamReader(cfg["ingress"])
+        if ingress_source is None
+        else EventStreamReader(cfg["ingress"], receiver=ingress_source)
+    )
+    sources = [ingress_reader] + [EventStreamReader(p) for p in cfg["ledgers"]]
     audit = (
         open_journal(
             cfg.get("audit_dir", score_path.parent), name="duru-control", fresh=False
@@ -349,7 +368,7 @@ def run(config, stop=None, *, publish=None):
     stopped_cleanly = False
     max_identities = 100000
     shutdown_deadline = None
-    score_publisher = None
+    worker_publisher = None
 
     def release_root(root, at):
         if any(request_identities[rid][0] == root for rid in worker_requests):
@@ -365,7 +384,8 @@ def run(config, stop=None, *, publish=None):
         closing_roots.discard(root)
 
     try:
-        score_publisher = ScorePublisher(channel_path(score_path))
+        worker_publisher = ScorePublisher(channel_path(score_path))
+        worker_publish = worker_publisher.publish
         while True:
             stopping = stop.is_set()
             if stopping and shutdown_deadline is None:
@@ -376,23 +396,29 @@ def run(config, stop=None, *, publish=None):
                     made_progress = True
                     if index == 0:
                         if row["event"] in (
-                            "send",
-                            "dispatch",
-                            "end",
-                            "cancel",
-                            "error",
-                            "program_end",
-                            "root_end",
+                            "request_arrived",
+                            "request_dispatched",
+                            "request_completed",
+                            "request_cancelled",
+                            "request_failed",
+                            "agent_end",
+                            "agent_group_end",
                         ):
                             serial += 1
                             heapq.heappush(heap, (row["time"], serial, "ingress", row))
                             if len(heap) > MAX_PENDING_EVENTS:
                                 raise RuntimeError("Duru pending-event limit exceeded")
-                    elif row["event"] == "request_end":
+                    elif row["event"] == "worker_request_finished":
                         for identity in row["requests"]:
                             serial += 1
                             heapq.heappush(
-                                heap, (row["time"], serial, "request_end", identity)
+                                heap,
+                                (
+                                    row["time"],
+                                    serial,
+                                    "worker_request_finished",
+                                    identity,
+                                ),
                             )
                             if len(heap) > MAX_PENDING_EVENTS:
                                 raise RuntimeError("Duru pending-event limit exceeded")
@@ -403,14 +429,15 @@ def run(config, stop=None, *, publish=None):
                             heapq.heappush(heap, (at, serial, row["event"], st))
                             if len(heap) > MAX_PENDING_EVENTS:
                                 raise RuntimeError("Duru pending-event limit exceeded")
-            # Closed journals cannot contribute later events or hold back other sources.
-            watermark = min(
-                (s.watermark for s in sources if not s.closed),
-                default=max(s.watermark for s in sources),
+            # Advance only through the time covered by every open event stream.
+            # Closed streams cannot produce more events or hold back the cutoff.
+            accounting_cutoff = min(
+                (s.received_through for s in sources if not s.closed),
+                default=max(s.received_through for s in sources),
             )
-            if watermark > 0:
-                while heap and heap[0][0] <= watermark:
-                    at, _, kind, r = heapq.heappop(heap)
+            if accounting_cutoff > 0:
+                while heap and heap[0][0] <= accounting_cutoff:
+                    at, _, kind, event_data = heapq.heappop(heap)
                     assert book.last is None or at >= book.last, (
                         "Late compact event",
                         at,
@@ -428,40 +455,42 @@ def run(config, stop=None, *, publish=None):
                     # Integrate E only on ingress transitions and at publication.
                     # This is the same integral without O(steps * active roots).
                     if kind == "ingress":
-                        if r["event"] == "send":
-                            request_id = r["request_id"]
+                        if event_data["event"] == "request_arrived":
+                            request_id = event_data["request_id"]
                             if request_id in request_identities:
                                 raise ValueError("Request ID reused: " + request_id)
-                            program_id = _program_id(r)
-                            identity = (r["root"], r["agent"])
+                            program_id = _program_id(event_data)
+                            identity = (event_data["root"], event_data["agent"])
                             if program_identities.get(program_id, identity) != identity:
                                 raise ValueError(
                                     "Router program identity changed: " + program_id
                                 )
                             program_identities[program_id] = identity
-                            request_programs[r["request_id"]] = program_id
+                            request_programs[event_data["request_id"]] = program_id
                             request_identities[request_id] = identity
                             book.submit(
-                                r["request_id"],
-                                r["root"],
-                                r["agent"],
-                                r["prompt_tokens"],
+                                event_data["request_id"],
+                                event_data["root"],
+                                event_data["agent"],
+                                event_data["prompt_tokens"],
                                 at,
                             )
-                        elif r["event"] == "dispatch":
-                            if r["request_id"] not in request_identities:
-                                raise ValueError("Dispatch without ingress request")
-                            worker_requests.add(r["request_id"])
-                        elif r["event"] == "root_end":
-                            root = r["root"]
+                        elif event_data["event"] == "request_dispatched":
+                            if event_data["request_id"] not in request_identities:
+                                raise ValueError(
+                                    "Request dispatched without an arrival event"
+                                )
+                            worker_requests.add(event_data["request_id"])
+                        elif event_data["event"] == "agent_group_end":
+                            root = event_data["root"]
                             if book.root_active[root]:
                                 raise ValueError(
                                     "Root completed with outstanding requests: " + root
                                 )
                             closing_roots.add(root)
                             release_root(root, at)
-                        elif r["event"] == "program_end":
-                            pid = _program_id(r)
+                        elif event_data["event"] == "agent_end":
+                            pid = _program_id(event_data)
                             if pid in request_programs.values():
                                 raise ValueError(
                                     "Program completed with outstanding requests: "
@@ -469,29 +498,33 @@ def run(config, stop=None, *, publish=None):
                                 )
                             program_identities.pop(pid, None)
                         else:
-                            book.finish(r["request_id"], at)
-                            request_programs.pop(r["request_id"], None)
+                            book.finish(event_data["request_id"], at)
+                            request_programs.pop(event_data["request_id"], None)
                     else:
-                        request_id = r["client_request_id"]
+                        request_id = event_data["client_request_id"]
                         # Terminal acknowledgements are idempotent. Old harnesses
                         # without dispatch tracking do not require this barrier.
-                        if kind == "request_end" and request_id not in worker_requests:
+                        if (
+                            kind == "worker_request_finished"
+                            and request_id not in worker_requests
+                        ):
                             continue
                         if request_id not in request_identities:
                             raise ValueError("Unjoined work: " + request_id)
-                        if (r.get("root"), r.get("agent")) != request_identities[
-                            request_id
-                        ]:
+                        if (
+                            event_data.get("root"),
+                            event_data.get("agent"),
+                        ) != request_identities[request_id]:
                             raise ValueError(
                                 "Worker request identity mismatch: " + request_id
                             )
-                        if kind == "request_end":
+                        if kind == "worker_request_finished":
                             worker_requests.discard(request_id)
-                            if r["root"] in closing_roots:
-                                release_root(r["root"], at)
+                            if event_data["root"] in closing_roots:
+                                release_root(event_data["root"], at)
                         else:
-                            book.accepted(r)
-                book.advance(watermark)
+                            book.accepted(event_data)
+                book.advance(accounting_cutoff)
                 requests = {
                     rid: dict(book.score(rid), program_id=request_programs[rid], **r)
                     for rid, r in book.active.items()
@@ -517,7 +550,7 @@ def run(config, stop=None, *, publish=None):
                     run_id=run_id,
                     extrapolated_cost_evaluations=book.extrapolated_cost_evaluations,
                     time=time.time(),
-                    observation_time=watermark,
+                    observation_time=accounting_cutoff,
                     capacity=book.capacity,
                     accounting_state=dict(
                         request_identities=len(request_identities),
@@ -535,7 +568,7 @@ def run(config, stop=None, *, publish=None):
                 )
                 if audit is not None:
                     snapshot.update(
-                        source_watermarks=[x.watermark for x in sources],
+                        source_received_through=[x.received_through for x in sources],
                         source_sequences=[x.sequence for x in sources],
                     )
                 if audit is not None or performance.enabled:
@@ -549,10 +582,9 @@ def run(config, stop=None, *, publish=None):
                         )
                         for r in set(book.agent_root.values())
                     }
-                if score_publisher is not None:
-                    score_publisher.publish(snapshot)
-                if publish is not None:
-                    publish(snapshot)
+                worker_publish(snapshot)
+                if router_publish is not None:
+                    router_publish(snapshot)
                 last_snapshot = snapshot
                 performance.observe(snapshot, len(heap))
                 if audit is not None and time.monotonic() - last_save >= 1:
@@ -571,7 +603,8 @@ def run(config, stop=None, *, publish=None):
         try:
             if heap:
                 logger.warning(
-                    "Stopping with %d events beyond the common watermark", len(heap)
+                    "Stopping with %d events beyond the common observation cutoff",
+                    len(heap),
                 )
             sequence += 1
             if audit is not None:
@@ -597,10 +630,10 @@ def run(config, stop=None, *, publish=None):
                 for source in sources:
                     source.close()
             finally:
-                if publish is not None:
-                    publish({})
-                if score_publisher is not None:
-                    score_publisher.close()
+                if router_publish is not None:
+                    router_publish({})
+                if worker_publisher is not None:
+                    worker_publisher.close()
 
 
 class RouterAccounting:
@@ -611,8 +644,13 @@ class RouterAccounting:
     Errors invalidate the local snapshot and are surfaced by check()/close().
     """
 
-    def __init__(self, config):
+    def __init__(self, config, *, ingress=None):
         self.config = config
+        self._ingress_source = None if ingress is None else ingress.journal
+        if self._ingress_source is not None and not isinstance(
+            self._ingress_source, InProcessChannel
+        ):
+            raise ValueError("Router-owned ingress must use in_process=True")
         self._snapshot = {}
         self._stop = threading.Event()
         self._error = None
@@ -625,12 +663,17 @@ class RouterAccounting:
         self.check()
         return self._snapshot
 
-    def _publish(self, snapshot):
+    def _router_publish(self, snapshot):
         self._snapshot = snapshot
 
     def _run(self):
         try:
-            run(self.config, self._stop, publish=self._publish)
+            run(
+                self.config,
+                self._stop,
+                router_publish=self._router_publish,
+                ingress_source=self._ingress_source,
+            )
         except BaseException as exc:
             self._snapshot = {}
             self._error = exc

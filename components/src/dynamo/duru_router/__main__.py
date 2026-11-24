@@ -14,7 +14,7 @@ from pathlib import Path
 import uvloop
 
 from dynamo.duru_router.args import parse_args
-from dynamo.duru_router.handler import DuruRouterHandler
+from dynamo.duru_router.handler import AccountingUnavailable, DuruRouterHandler
 from dynamo.duru_router.scoring import Ingress, RouterAccounting, score_channel
 from dynamo.runtime import DistributedRuntime, dynamo_worker
 from dynamo.thunderagent_router.__main__ import serve_router
@@ -27,6 +27,14 @@ async def serve(runtime, config, handler):
         done, _ = await asyncio.wait(
             (serving, monitoring), return_when=asyncio.FIRST_COMPLETED
         )
+        if monitoring in done:
+            try:
+                monitoring.result()
+            except AccountingUnavailable:
+                # Keep endpoints available to return explicit request errors
+                # and status, while already-dispatched requests finish.
+                await serving
+                return
         for task in done:
             task.result()
     finally:
@@ -46,8 +54,8 @@ async def worker(runtime: DistributedRuntime) -> None:
         raise ValueError("Ingress channel must be named duru-ingress.jsonl")
     os.environ["DURU_SCORES"] = settings["scores"]
     score_channel()
-    ingress = Ingress(ingress_path.parent)
-    accounting = RouterAccounting(accounting_config)
+    ingress = Ingress(ingress_path.parent, in_process=True)
+    accounting = RouterAccounting(accounting_config, ingress=ingress)
     try:
         accounting.start()
         handler = DuruRouterHandler(

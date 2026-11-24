@@ -31,8 +31,9 @@ def test_accounting_failure_invalidates_local_scores(monkeypatch):
 @pytest.mark.parametrize(
     "record,diagnostics", [(False, False), (False, True), (True, False)]
 )
+@pytest.mark.parametrize("in_process", [False, True])
 def test_router_owned_accounting_matches_worker_snapshot(
-    tmp_path, monkeypatch, record, diagnostics
+    tmp_path, monkeypatch, record, diagnostics, in_process
 ):
     path, cfg = configuration(tmp_path)
     monkeypatch.setenv("DURU_SCORES", cfg["scores"])
@@ -57,7 +58,7 @@ def test_router_owned_accounting_matches_worker_snapshot(
             cfg["ingress"],
             [
                 dict(
-                    event="send",
+                    event="request_arrived",
                     time=now - 0.01,
                     root="r",
                     agent="a",
@@ -77,13 +78,18 @@ def test_router_owned_accounting_matches_worker_snapshot(
         ),
     ]
     feeds = []
+    ingress = None
     for logical, rows in streams:
         logical = Path(logical)
-        feed = open_feed(logical.parent, name=logical.stem)
+        if in_process and str(logical) == cfg["ingress"]:
+            ingress = scoring.Ingress(logical.parent, in_process=True)
+            feed = ingress.journal
+        else:
+            feed = open_feed(logical.parent, name=logical.stem)
         feeds.append(feed)
         for i, row in enumerate(rows, 1):
             feed.submit("record", dict(sequence=i, **row))
-    owner = scoring.RouterAccounting(path).start()
+    owner = scoring.RouterAccounting(path, ingress=ingress).start()
     engine_reader = scoring.Reader()
     try:
         deadline = time.monotonic() + 5
@@ -101,8 +107,9 @@ def test_router_owned_accounting_matches_worker_snapshot(
         }
         assert ("roots" in snapshot) is (record or diagnostics)
         assert ("source_sequences" in snapshot) is record
-        assert ("source_watermarks" in snapshot) is record
+        assert ("source_received_through" in snapshot) is record
         if not record:
+            assert not Path(cfg["audit_dir"]).exists()
             assert not list(tmp_path.rglob("*.jsonl"))
         assert owner.reader.snapshot_source is not None
         assert owner._thread is not threading.current_thread()
