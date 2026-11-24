@@ -180,3 +180,21 @@ PYTHONPATH=components/src python3 -m pytest components/src/dynamo/duru_router/te
 CPU tests cover U, admission, lifecycle cleanup, cancellation, failures, and actual
 IPC. They use engine stand-ins; full Dynamo frontend/runtime/GPU integration needs
 separate validation. See [RFC.md](RFC.md) for the proposal and merge plan.
+
+## Citation
+
+If you use Duru in your research, please cite
+[*Towards Fair Resource Sharing in Agentic LLM Serving*](https://arxiv.org/abs/2611.23558v1):
+
+```bibtex
+@misc{lee2026duru,
+  title         = {Towards Fair Resource Sharing in Agentic {LLM} Serving},
+  author        = {Sehyeon Lee and Yuchen Xia and Zhaoyang Hong and Jinrui Hu
+                   and Anuradha Pandey and Evan Zhao and Ankita Nayak and Nishil Talati},
+  year          = {2026},
+  eprint        = {2611.23558},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.OS},
+  url           = {https://arxiv.org/abs/2611.23558}
+}
+```
