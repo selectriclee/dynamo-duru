@@ -109,6 +109,4 @@ def design(
         decode_warmup_tokens=8,
         capture_sizes=captures,
         prefill_graphs=prefill_graphs,
-        point_selection="graph_neighbors_and_geometric_context_v1",
-        measurement_only=True,
     )

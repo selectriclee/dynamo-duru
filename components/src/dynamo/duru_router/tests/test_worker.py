@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 import pytest
 
+pytestmark = [pytest.mark.pre_merge, pytest.mark.unit, pytest.mark.gpu_0]
+
 
 class NativeQueue(deque):
     def remove_request(self, request):
@@ -68,6 +70,14 @@ class NativeScheduler:
             raise self.failure
         return "native-output"
 
+    def finish_requests(self, request_ids, status=None):
+        finished = [
+            self.requests.pop(rid) for rid in request_ids if rid in self.requests
+        ]
+        for request in finished:
+            request.finished = True
+        return finished
+
     def shutdown(self):
         self.stopped = True
         if self.failure is not None:
@@ -84,6 +94,9 @@ class Feed:
         if not self.lock._is_owned():
             raise RuntimeError("Capture must hold the clock lock")
         self.events.append((event, fields))
+
+    def emit(self, event, **fields):
+        self.capture(event, fields)
 
     def close(self):
         self.closed = True
@@ -217,19 +230,28 @@ def test_coordinates_and_accepted_work(
     scheduler.add_request(request)
     batch = scheduled(count)
     scheduler._update_after_schedule(batch)
-    step = scheduler.compact_feed.events[0][1]["steps"][0]
-    assert (step["p"], step["d"], step["k"], step["phase"]) == (
-        count,
-        computed,
-        computed + count,
-        phase,
-    )
+    assert scheduler.compact_feed.events == []
     assert request.num_computed_tokens == computed + count
     assert (
         scheduler.update_from_output(batch, output(tokens, finished=finished))
         == "native-output"
     )
-    accepted = scheduler.compact_feed.events[-1][1]["steps"][0]
+    accepted = next(
+        fields["steps"][0]
+        for event, fields in scheduler.compact_feed.events
+        if event == "accepted_output"
+    )
+    assert (accepted["p"], accepted["d"], accepted["k"], accepted["phase"]) == (
+        count,
+        computed,
+        computed + count,
+        phase,
+    )
+    if finished:
+        assert scheduler.compact_feed.events[-1] == (
+            "request_end",
+            {"requests": [scheduler.identity(request)]},
+        )
     assert accepted["accepted"] and accepted["generated_tokens"] == tokens
     assert accepted["end"] >= accepted["scheduled_at"]
     assert ("r" not in scheduler.requests) == finished
@@ -310,7 +332,20 @@ def test_native_failure_emits_no_work_and_closes_feed(scheduler, batch):
     scheduler.failure = RuntimeError("native failure")
     with pytest.raises(RuntimeError, match="native failure"):
         scheduler.update_from_output(batch, output())
-    assert [event for event, _ in scheduler.compact_feed.events] == ["scheduled"]
+    assert scheduler.compact_feed.events == []
     with pytest.raises(RuntimeError, match="native failure"):
         scheduler.shutdown()
     assert scheduler.stopped and scheduler.compact_feed.closed
+
+
+def test_abort_acknowledges_native_removal_before_stale_output(scheduler, batch):
+    request = scheduler.requests["r"]
+    assert scheduler.finish_requests(["r"]) == [request]
+    assert scheduler.compact_feed.events[-1] == (
+        "request_end",
+        {"requests": [scheduler.identity(request)]},
+    )
+    scheduler.update_from_output(batch, output())
+    step = scheduler.compact_feed.events[-1][1]["steps"][0]
+    assert not step["accepted"]
+    assert step["generated_tokens"] == 0

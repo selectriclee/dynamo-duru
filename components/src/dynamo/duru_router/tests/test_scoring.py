@@ -1,20 +1,17 @@
 """U calculation and score-service lifecycle regressions."""
 
 import json
-import os
-import signal
-import subprocess
-import sys
+import tempfile
 import threading
-import time
 import unittest
-from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from dynamo.duru_router.calibration.plan import METRIC
+
 from dynamo.duru_router.scoring import Ingress, LiveU, priority_key, run
+from dynamo.duru_router.tests.helpers import configuration
+from dynamo.duru_router.tests.replay_helpers import replay_accounting
 
 
 def work_step(*, p=100, d=0, root="root", agent="agent", **fields):
@@ -113,7 +110,6 @@ class TestUCalculation(unittest.TestCase):
         self.assertIsNone(b.score("a")["U"])
         self.assertEqual(b.score("a")["lookahead_s"], 6.0)
         self.assertEqual(b.score("a")["score"], 1.0)
-        b.dispatched("agent")
         self.assertEqual(b.score("a")["score"], 1.0)
         self.assertEqual(b.score("a")["kind"], "zero_work_root_next_five")
 
@@ -133,7 +129,6 @@ class TestUCalculation(unittest.TestCase):
         b = self.book()
         b.accepted(dict(accepted=False))
         self.assertEqual(b.work, {})
-        self.assertFalse(b.executed_agents)
 
     def test_valid_subunit_scores_and_invalid_fallback(self):
         values = [None, 0.2, float("nan"), 0.8, 0.8, 0.0]
@@ -220,6 +215,7 @@ class TestUCalculation(unittest.TestCase):
 
 
 def write_rows(path, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         "".join(
             json.dumps(dict(row, sequence=i)) + "\n" for i, row in enumerate(rows, 1)
@@ -252,31 +248,7 @@ def send_record(
 
 @pytest.fixture
 def config(tmp_path):
-    calibration = tmp_path / "calibration.json"
-    calibration.write_text(
-        json.dumps(
-            dict(
-                schema_version=1,
-                timing_metric=METRIC,
-                contract={"model": "cpu"},
-                max_prefill=8,
-                prefill=dict(P=[1, 8], D=[0, 8], wall_ms=[[10, 10], [10, 10]]),
-                decode=dict(grid=[dict(K=1, wall_ms=10), dict(K=16, wall_ms=10)]),
-            )
-        )
-    )
-    cfg = dict(
-        ingress=str(tmp_path / "ingress.jsonl"),
-        ledgers=[str(tmp_path / "worker.jsonl")],
-        scores=str(tmp_path / "output" / "scores.json"),
-        capacity=1,
-        calibration=str(calibration),
-        runtime_contract={"model": "cpu"},
-        audit_dir=str(tmp_path / "audit"),
-    )
-    path = tmp_path / "config.json"
-    path.write_text(json.dumps(cfg))
-    return path, cfg
+    return configuration(tmp_path)
 
 
 @pytest.fixture
@@ -289,7 +261,6 @@ def records(config):
     ]
     step = work_step(p=8, client_request_id="req", scheduled_at=100.1, end=100.2)
     worker = [
-        dict(time=100.1, event="scheduled", steps=[dict(step)]),
         dict(time=100.2, event="accepted_output", steps=[dict(step)]),
         # Closed workers must not hold back later ingress events.
         dict(time=100.3, event="footer"),
@@ -297,40 +268,6 @@ def records(config):
     write_rows(Path(cfg["ingress"]), ingress)
     write_rows(Path(cfg["ledgers"][0]), worker)
     return ingress, worker
-
-
-@contextmanager
-def service(config_path):
-    with subprocess.Popen(
-        [sys.executable, "-m", "dynamo.duru_router.scoring", str(config_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    ) as process:
-        try:
-            yield process
-        finally:
-            if process.poll() is None:
-                process.terminate()
-                try:
-                    process.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.communicate(timeout=5)
-
-
-def wait_until(process, condition):
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            _, error = process.communicate(timeout=1)
-            pytest.fail(f"Scoring exited early: {error}")
-        result = condition()
-        if result:
-            return result
-        time.sleep(0.01)
-    pytest.fail("Timed out waiting for scoring service")
 
 
 def audit_rows(cfg):
@@ -341,7 +278,7 @@ def run_once(config):
     path, cfg = config
     stop = threading.Event()
     stop.set()
-    run(path, stop)
+    replay_accounting(path, stop)
     return audit_rows(cfg)[-1]
 
 
@@ -350,54 +287,11 @@ def run_once(config):
 @pytest.mark.gpu_0
 @pytest.mark.timeout(30)
 class TestScoringService:
-    @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
-    def test_process_group_signal_flushes_and_restart_replays(
-        self, config, records, sig
-    ):
-        path, cfg = config
-        score = Path(cfg["scores"])
-        run_ids = set()
-        for _ in range(2):
-            with service(path) as process:
-                wait_until(process, score.exists)
-                snapshot = json.loads(score.read_text())
-                assert snapshot["accepted_steps"] == 1
-                assert snapshot["roots"]["root"]["U"] == pytest.approx(40)
-                assert not snapshot["requests"]
-                assert set(snapshot["programs"]) == {"native/session"}
-                assert (
-                    snapshot["programs"]["native/session"]["kind"]
-                    == "idle_measured_only"
-                )
-                run_ids.add(snapshot["run_id"])
-                os.killpg(process.pid, sig)
-                _, error = process.communicate(timeout=5)
-                assert process.returncode == 0, error
-            assert not score.exists()
-            footer = audit_rows(cfg)[-1]
-            assert footer["event"] == "footer"
-            assert footer["pending_events"] == 0
-            assert footer["complete"]
-            assert footer["last_snapshot"]["roots"] == snapshot["roots"]
-        assert len(run_ids) == 2
-        assert {row["run_id"] for row in audit_rows(cfg)} == run_ids
-
-    def test_shutdown_while_inputs_missing_removes_old_snapshot(self, config):
-        path, cfg = config
-        score = Path(cfg["scores"])
-        score.parent.mkdir()
-        score.write_text("old snapshot")
-        with service(path) as process:
-            wait_until(
-                process, lambda: not score.exists() and Path(cfg["audit_dir"]).exists()
-            )
-            os.killpg(process.pid, signal.SIGTERM)
-            _, error = process.communicate(timeout=5)
-            assert process.returncode == 0, error
-        footer = audit_rows(cfg)[-1]
+    def test_shutdown_with_missing_inputs_is_incomplete(self, config):
+        footer = run_once(config)
         assert footer["last_snapshot"] is None
         assert not footer["complete"]
-        assert not score.exists()
+        assert not Path(config[1]["scores"]).exists()
 
     @pytest.mark.parametrize("closed", [False, True])
     def test_final_pass_respects_input_watermarks(self, config, records, closed):
@@ -410,36 +304,18 @@ class TestScoringService:
         if closed:
             assert footer["last_snapshot"]["accepted_steps"] == 1
 
-    def test_invalid_worker_configuration_invalidates_old_scores(self, config):
+    def test_invalid_worker_configuration_is_rejected(self, config, monkeypatch):
         path, cfg = config
-        score = Path(cfg["scores"])
-        score.parent.mkdir()
-        score.write_text("old snapshot")
+        monkeypatch.setenv("DURU_ACCOUNTING_TRANSPORT", "memory")
         cfg["ledgers"] = []
         path.write_text(json.dumps(cfg))
         with pytest.raises(ValueError, match="worker ledger"):
             run(path)
-        assert not score.exists()
-
-    def test_partial_footer_is_incomplete_until_newline_arrives(self, config, records):
-        worker = Path(config[1]["ledgers"][0])
-        worker.write_bytes(worker.read_bytes().rstrip(b"\n"))
-        assert not run_once(config)["complete"]
-        with worker.open("ab") as stream:
-            stream.write(b"\n")
-        footer = run_once(config)
-        assert footer["complete"]
-        assert footer["last_snapshot"]["accepted_steps"] == 1
-
-    def test_journal_gap_never_reports_complete_or_leaves_scores(self, config, records):
-        cfg = config[1]
-        Path(cfg["ledgers"][0]).write_text(
-            json.dumps(dict(sequence=2, event="footer", time=101)) + "\n"
-        )
-        with pytest.raises(AssertionError, match="Journal gap"):
-            run_once(config)
-        assert not audit_rows(cfg)[-1]["complete"]
         assert not Path(cfg["scores"]).exists()
+
+    def test_live_accounting_rejects_journal_transport(self, config):
+        with pytest.raises(ValueError, match="requires IPC"):
+            run(config[0])
 
     @pytest.mark.parametrize(
         "case, message",
@@ -471,14 +347,11 @@ class TestScoringService:
         assert not audit_rows(cfg)[-1]["complete"]
         assert not Path(cfg["scores"]).exists()
 
-    @pytest.mark.parametrize("event_index", [0, 1], ids=["scheduled", "accepted"])
     @pytest.mark.parametrize("field", ["client_request_id", "root", "agent"])
-    def test_worker_identity_must_join_ingress(
-        self, config, records, event_index, field
-    ):
+    def test_worker_identity_must_join_ingress(self, config, records, field):
         cfg = config[1]
         _, worker = records
-        worker[event_index]["steps"][0][field] = "unknown"
+        worker[0]["steps"][0][field] = "unknown"
         write_rows(Path(cfg["ledgers"][0]), worker)
         message = (
             "Unjoined work"
@@ -516,21 +389,6 @@ class TestScoringService:
         assert snapshot["roots"]["root"]["active_agents"] == 1
         assert snapshot["roots"]["root"]["E"] == pytest.approx(0.45)
 
-    def test_accepted_work_after_ingress_end_retains_request_identity(
-        self, config, records
-    ):
-        ingress, _ = records
-        ingress[1]["time"] = 100.15
-        write_rows(Path(config[1]["ingress"]), ingress)
-        footer = run_once(config)
-        assert footer["complete"]
-        snapshot = footer["last_snapshot"]
-        assert snapshot["accepted_steps"] == 1
-        assert not snapshot["requests"]
-        assert snapshot["roots"]["root"]["E"] == pytest.approx(0.15)
-        assert snapshot["roots"]["root"]["W"] == pytest.approx(0.01)
-        assert snapshot["programs"]["native/session"]["U"] == pytest.approx(15)
-
     @pytest.mark.parametrize("bad_id", [None, "", 7])
     def test_ingress_requires_program_id_and_rejects_second_producer(
         self, tmp_path, bad_id
@@ -567,3 +425,12 @@ class TestScoringService:
                 with pytest.raises(RuntimeError, match="footer rejected"):
                     ingress.close()
             close.assert_called_once()
+
+
+@pytest.fixture(autouse=True)
+def journal_validation_mode(monkeypatch):
+    monkeypatch.setenv("DURU_ACCOUNTING_TRANSPORT", "journal")
+    monkeypatch.setenv("DURU_RECORD_EVENTS", "1")
+    with tempfile.TemporaryDirectory(prefix="duru-replay-test-") as directory:
+        monkeypatch.setenv("DURU_IPC_DIR", directory)
+        yield

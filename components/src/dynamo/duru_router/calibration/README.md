@@ -72,8 +72,10 @@ PYTHONPATH=components/src python3 -m dynamo.duru_router.calibration measure \
 The contract must include `timing_metric: "engine_service_time_v1"` and the actual
 model/runtime/hardware settings. Each completed point is checkpointed. Resume
 with `--resume`; the plan, vocabulary and contract must match. Raw samples are
-retained. The output is `calibration.json`, marked `measurement_only: true`, with
-no `quality_passed` or `ready_for_u` accuracy gate.
+retained. The output is `calibration.json`, without an accuracy gate.
+Existing calibration artifacts remain loadable. To resume an older checkpoint,
+reuse its saved plan: regenerating a plan after metadata cleanup changes the
+checkpoint fingerprint even when the measurement cases are identical.
 
 ## Runtime use
 

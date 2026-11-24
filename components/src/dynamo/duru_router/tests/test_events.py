@@ -4,8 +4,16 @@ import time
 from unittest.mock import patch
 
 import pytest
+
 from dynamo.duru_router.events import CompactFeed, open_journal
-from dynamo.duru_router.scoring import Tail
+from dynamo.duru_router.tests.replay_helpers import Tail
+
+pytestmark = [
+    pytest.mark.post_merge,
+    pytest.mark.integration,
+    pytest.mark.gpu_0,
+    pytest.mark.timeout(30),
+]
 
 
 def test_compact_coordinates_and_clock_ordering(tmp_path):
@@ -38,7 +46,6 @@ def test_compact_coordinates_and_clock_ordering(tmp_path):
                     generated_tokens=1,
                     prompt_tokens=999,
                 )
-                feed.capture("scheduled", dict(steps=[step]))
                 # The real clock thread attempts a write while the callback owns
                 # the lock. Its newer timestamp must follow accepted work.
                 assert clock_started.wait(timeout=1)
@@ -98,3 +105,9 @@ def test_writer_failure_surfaces_and_close_releases_resources(tmp_path):
         journal.close()
     assert journal.closed
     assert not journal.thread.is_alive()
+
+
+@pytest.fixture(autouse=True)
+def journal_validation_mode(monkeypatch):
+    monkeypatch.setenv("DURU_ACCOUNTING_TRANSPORT", "journal")
+    monkeypatch.setenv("DURU_RECORD_EVENTS", "1")

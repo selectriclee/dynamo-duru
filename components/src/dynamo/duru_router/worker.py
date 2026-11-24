@@ -79,7 +79,7 @@ class DuruScheduler(AsyncScheduler):
         return priority_key(score, request.arrival_time, index)
 
     def schedule(self, *args, **kwargs):
-        snapshot = self.u_reader.refresh(force=True)
+        snapshot = self.u_reader.refresh()
         held = []
         try:
             for queue in (self.waiting, self.kv_holding_waiting):
@@ -119,16 +119,14 @@ class DuruScheduler(AsyncScheduler):
                         p=count,
                         d=computed,
                         k=computed + count,
-                        phase="prefill"
-                        if computed < request.num_prompt_tokens or count > 1
-                        else "decode",
+                        phase=(
+                            "prefill"
+                            if computed < request.num_prompt_tokens or count > 1
+                            else "decode"
+                        ),
                     ),
                 )
             self._pending_work[id(scheduler_output)] = pending
-            if pending:
-                self.compact_feed.capture(
-                    "scheduled", dict(steps=[step for _, step in pending.values()])
-                )
             return super()._update_after_schedule(scheduler_output)
 
     def update_from_output(self, scheduler_output, runner_output):
@@ -164,18 +162,39 @@ class DuruScheduler(AsyncScheduler):
                         step,
                         accepted=accepted,
                         end=ended,
-                        generated_tokens=max(
-                            0, request.num_output_tokens - previous_tokens
-                        )
-                        if accepted
-                        else 0,
+                        generated_tokens=(
+                            max(0, request.num_output_tokens - previous_tokens)
+                            if accepted
+                            else 0
+                        ),
                     )
                 )
             self.compact_feed.capture("accepted_output", dict(steps=steps))
+            finished = [
+                self.identity(request)
+                for rid, (request, _) in pending.items()
+                if acceptance[rid][0] and request.is_finished()
+            ]
+            if finished:
+                self.compact_feed.emit("request_end", requests=finished)
             return result
+
+    def finish_requests(self, *args, **kwargs):
+        # Abort acknowledgement follows native removal. Later stale output cannot
+        # be accepted, so accounting may release a terminal root after this event.
+        with self.compact_feed.lock:
+            finished = super().finish_requests(*args, **kwargs)
+            if finished:
+                self.compact_feed.emit(
+                    "request_end", requests=[self.identity(r) for r in finished]
+                )
+            return finished
 
     def shutdown(self):
         try:
             return super().shutdown()
         finally:
-            self.compact_feed.close()
+            try:
+                self.compact_feed.close()
+            finally:
+                self.u_reader.close()

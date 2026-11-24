@@ -21,6 +21,7 @@ import time
 from typing import Any, Optional
 
 import uvloop
+
 from dynamo.common.utils.token_ids import token_ids_len
 from dynamo.llm import (
     KvRouter,
@@ -227,6 +228,7 @@ class ThunderAgentRouterHandler:
                 else None
             )
             first_chunk = True
+            await self._before_dispatch(preprocessed)
             async for chunk in await self._kv_router.generate_from_request(
                 preprocessed,  # type: ignore[arg-type]
                 context=context,
@@ -307,6 +309,7 @@ class ThunderAgentRouterHandler:
             else None
         )
         try:
+            await self._before_dispatch(preprocessed)
             async for chunk in await self._kv_router.generate_from_request(
                 preprocessed,  # type: ignore[arg-type]
                 context=context,
@@ -379,6 +382,9 @@ class ThunderAgentRouterHandler:
                 replica_pin,
                 selected_worker_id,
             )
+
+    async def _before_dispatch(self, request: dict[str, Any]) -> None:
+        """Observe an admitted request immediately before backend dispatch."""
 
     async def status(self, request: Optional[dict[str, Any]] = None):
         scheduler_status = (

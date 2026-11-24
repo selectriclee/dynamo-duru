@@ -18,6 +18,8 @@ import threading
 import time
 from pathlib import Path
 
+from dynamo.duru_router.transport import Sender, channel_path, transport
+
 FIELDS = (
     "client_request_id",
     "root",
@@ -184,13 +186,31 @@ def _write_events(path):
                 last_flush = time.monotonic()
 
 
+def open_feed(directory, *, name):
+    if transport() == "journal":
+        return open_journal(directory, name=name)
+    recording = (
+        open_journal(directory, name=name)
+        if os.environ.get("DURU_RECORD_EVENTS") == "1"
+        else None
+    )
+    try:
+        return Sender(
+            channel_path(Path(directory) / f"{name}.jsonl"), recording=recording
+        )
+    except BaseException:
+        if recording is not None:
+            recording.close()
+        raise
+
+
 class CompactFeed:
     def __init__(self, directory):
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.error = None
         self.sequence = 0
-        self.journal = open_journal(directory, name="compact-work")
+        self.journal = open_feed(directory, name="compact-work")
         self.emit("header", schema=1)
         self.thread = threading.Thread(
             target=self._clock, name="compact-U-clock", daemon=True
@@ -208,13 +228,13 @@ class CompactFeed:
             )
 
     def capture(self, event, fields):
-        if event not in ("scheduled", "accepted_output"):
+        if event != "accepted_output":
             return
         # Immutable small records only: no token arrays, cache state or runtime strings.
         steps = [
             {k: s[k] for k in FIELDS if k in s}
             for s in fields["steps"]
-            if event == "scheduled" or s["accepted"]
+            if s["accepted"]
         ]
         self.emit(event, steps=steps)
 

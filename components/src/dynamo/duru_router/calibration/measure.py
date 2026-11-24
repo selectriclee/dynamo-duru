@@ -54,7 +54,6 @@ def fit(points, plan, contract):
         schema_version=1,
         timing_metric=METRIC,
         contract=contract,
-        measurement_only=True,
         max_prefill=plan["max_prefill"],
         prefill=dict(
             P=plan["P"],

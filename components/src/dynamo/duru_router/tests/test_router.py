@@ -4,10 +4,14 @@ import time
 from unittest.mock import patch
 
 import pytest
+
 from dynamo.duru_router import router as router_module
 from dynamo.duru_router.router import DuruScheduler, ThunderAgentConfig
 from dynamo.duru_router.scoring import Reader
+from dynamo.thunderagent_router.policy import ResumeChoice
 from dynamo.thunderagent_router.program_state import ProgramLifecycle, ProgramStatus
+
+pytestmark = [pytest.mark.pre_merge, pytest.mark.unit, pytest.mark.gpu_0]
 
 
 class Capacity:
@@ -32,6 +36,11 @@ class RouterCase:
                 buffer_per_program=0,
                 pause_threshold=1.0,
                 resume_hysteresis=0.0,
+            ),
+            reader=Reader(
+                snapshot_source=lambda: (
+                    json.loads(self.path.read_text()) if self.path.exists() else {}
+                )
             ),
         )
 
@@ -76,48 +85,82 @@ class RouterCase:
     def admitted(self):
         return [event["program"] for event in self.events]
 
+    def used(self, replica):
+        # Read the same occupancy buckets used by the shared scheduler.
+        return self.r._replica_usage_locked(self.cap.caps)[replica].used
+
 
 @pytest.fixture
 async def case(tmp_path, monkeypatch):
+    monkeypatch.setenv("DURU_SCORES", str(tmp_path / "scores.json"))
     case = RouterCase(tmp_path / "scores.json")
-    monkeypatch.setenv("DURU_SCORES", str(case.path))
     monkeypatch.setenv("DURU_AUDIT_DIR", str(tmp_path))
     monkeypatch.delenv("DURU_ADMISSION_ALPHA", raising=False)
-    for name, value in dict(
-        reader=None, journal=None, sequence=0, decision_snapshot={}, last_defer={}
-    ).items():
-        monkeypatch.setattr(router_module, name, value)
-    monkeypatch.setattr(
-        router_module,
-        "record_choice",
-        lambda p, kind="resume", **kw: case.events.append(
-            dict(program=p, event=kind, control=router_module.score_row(p), **kw)
-        ),
-    )
+    monkeypatch.delenv("DURU_DIAGNOSTICS", raising=False)
+    selected = None
+
+    def observe_selection(method):
+        def select(*args, **kwargs):
+            nonlocal selected
+            selected = method(*args, **kwargs)
+            return selected
+
+        return select
+
+    original_resume = case.r._resume_program
+
+    def observe_resume(program, replica):
+        # Observe the host's real decisions rather than requiring production
+        # audit logging to expose scheduling behavior to tests.
+        assert selected is not None and selected.replica == replica
+        case.events.append(
+            dict(
+                program=program.program_id,
+                score=case.r._policy.score_row(program.program_id).get("score"),
+                forced=selected.forced,
+                remaining=selected.remaining,
+            )
+        )
+        original_resume(program, replica)
+
+    for method in ("_select_resume_locked", "_select_resume_override_locked"):
+        monkeypatch.setattr(case.r, method, observe_selection(getattr(case.r, method)))
+    monkeypatch.setattr(case.r, "_resume_program", observe_resume)
     try:
         yield case
     finally:
         for task in case.tasks:
             task.cancel()
         await asyncio.wait_for(asyncio.gather(*case.tasks, return_exceptions=True), 1)
-        if router_module.journal is not None:
-            router_module.journal.close()
 
 
-async def test_reader_pins_one_decision_and_retains_stale_evidence(case):
-    case.score("high", 1.4)
-    case.save()
-    reader = Reader()
-    snapshot = reader.refresh(force=True)
+@pytest.mark.parametrize("diagnostics", [False, True])
+@pytest.mark.parametrize("demand,forced", [(100, False), (1200, True)])
+async def test_optional_diagnostics_preserve_admission(
+    case, monkeypatch, caplog, diagnostics, demand, forced
+):
+    monkeypatch.setenv("DURU_DIAGNOSTICS", "1" if diagnostics else "0")
+    monkeypatch.setenv("DURU_ADMISSION_ALPHA", "1")
+    caplog.set_level("INFO", logger="dynamo.duru_router.diagnostics")
+    case.put("ready", demand, 2)
     with patch(
-        "dynamo.duru_router.scoring.time.time",
-        return_value=snapshot["observation_time"] + 3,
+        "dynamo.duru_router.events.open_journal",
+        side_effect=AssertionError("Admission must not open an audit journal"),
     ):
-        with reader.pin(snapshot):
-            assert reader.refresh()["programs"]["high"]["score"] == 1.4
-        assert reader.refresh() == {}
-        assert reader.reason == "stale_snapshot"
-        assert reader.snapshot["programs"]["high"]["score"] == 1.4
+        await case.resume()
+    assert case.admitted == ["ready"]
+    assert case.events[0]["forced"] is forced
+    records = [r for r in caplog.records if r.name.endswith(".diagnostics")]
+    assert len(records) == int(diagnostics)
+    if diagnostics:
+        row = json.loads(records[0].getMessage().split(" ", 1)[1])
+        assert row["forced"] is forced
+        assert row["U"] == 2
+        assert row["required"] == demand
+        assert row["remaining_before"] == 1000
+        assert row["worker"] == [1, 0]
+        assert row["request_id"] == "ready"
+    assert not hasattr(router_module, "journal")
 
 
 @pytest.mark.parametrize("cancel", [False, True], ids=["recover", "cancel"])
@@ -160,8 +203,8 @@ async def test_stale_scores_block_admission_then_fresh_scores_restore_rank(
     await case.r._scheduler_tick()
     await asyncio.wait_for(high, 1)
     assert case.admitted == ["high"]
-    assert case.events[0]["control"]["score"] == 1.4
-    assert case.events[0]["event"] == ("u_threshold_resume" if override else "resume")
+    assert case.events[0]["score"] == 1.4
+    assert case.events[0]["forced"] is override
     assert not low.done()
 
 
@@ -196,9 +239,7 @@ async def test_backfill_skips_nonfits_without_overcommitting(
     await case.resume()
     assert case.admitted == (["small", "tiny"] if fragmented else ["medium", "tiny"])
     assert "large" in case.r._table.paused
-    assert all(
-        case.r._worker_used(key) <= capacity for key, capacity in case.cap.caps.items()
-    )
+    assert all(case.used(key) <= capacity for key, capacity in case.cap.caps.items())
     for program in list(case.admitted):
         await case.r.end_program(program)
     case.cap.caps = {(1, 0): 1500}
@@ -214,7 +255,7 @@ async def test_new_arrival_joins_existing_rank(case):
     task = await case.start("new_low", 400)
     assert case.admitted == ["older_high"]
     assert not task.done()
-    assert case.r._worker_used((1, 0)) == 800
+    assert case.used((1, 0)) == 800
 
 
 async def test_capacity_pauses_only_at_safe_boundary_and_never_for_score_alone(case):
@@ -236,7 +277,7 @@ async def test_capacity_pauses_only_at_safe_boundary_and_never_for_score_alone(c
     await case.r.after_request("busy", 900, 0)
     await case.r._scheduler_tick()
     assert busy.lifecycle == ProgramLifecycle.PAUSED
-    assert case.r._worker_used((1, 0)) == 0
+    assert case.used((1, 0)) == 0
 
 
 @pytest.mark.parametrize(
@@ -252,7 +293,7 @@ async def test_idle_reservation_competes_by_measured_u(
     await case.resume()
     assert case.admitted == [winner]
     assert idle.status == ProgramStatus.ACTING
-    assert case.r._worker_used((1, 0)) == 600
+    assert case.used((1, 0)) == 600
 
 
 async def test_newcomer_preserves_resume_headroom_for_established_waiters(case):
@@ -282,7 +323,7 @@ async def test_lookahead_crossing_alpha_unblocks_pending_request(case, monkeypat
     await case.resume()
     assert (await asyncio.wait_for(task, 1)).assigned_replica_hint == (1, 0)
     assert case.r._stat_forced_resumes == 1
-    assert case.events[-1]["event"] == "u_threshold_resume"
+    assert case.events[-1]["forced"]
 
 
 async def test_missing_scores_and_nonpending_requests_cannot_force_admission(
@@ -328,7 +369,7 @@ async def test_cancelled_waiter_cannot_reappear_or_force_admit(
     assert not case.r._table.programs
     assert not case.r._admission_gates
     assert case.r._stat_forced_resumes == 0
-    assert case.r._worker_used((1, 0)) == 0
+    assert case.used((1, 0)) == 0
 
 
 async def test_repeated_cancellation_finishes_blocked_rollback(case):
@@ -386,3 +427,160 @@ async def test_concurrent_admission_and_end_release_state_for_next_wave(
         assert not case.r._table.paused
         assert not case.r._admission_gates
     assert case.r._stat_forced_resumes == 6
+
+
+async def test_resume_updates_weighted_reservations_between_policy_choices(case):
+    case.r._cfg.acting_token_weight = 0.5
+    case.r._cfg.buffer_per_program = 10
+    case.put("idle", 600, 3).status = ProgramStatus.ACTING
+    case.put("pending", 600, 2)
+    case.put("tail", 100, 1)
+
+    await case.resume()
+
+    # Idle requires 610 to fit, but reserves 300 + 10 after admission. The
+    # next choice must see that weighted reservation, then the pending 610.
+    assert case.admitted == ["idle", "pending"]
+    assert [event["remaining"] for event in case.events] == [1000, 690]
+    assert case.used((1, 0)) == 920
+    assert list(case.r._table.paused) == ["tail"]
+
+
+@pytest.mark.parametrize("override", [False, True], ids=["fit", "alpha"])
+async def test_policy_placement_uses_replica_ties_and_decayed_usage(
+    case, monkeypatch, override
+):
+    # Same worker, reverse DP-rank insertion order: normal fits prefer the
+    # smaller replica key, while the override uses current decayed occupancy.
+    case.cap.caps = {(7, 1): 1000, (7, 0): 1000}
+    if override:
+        monkeypatch.setenv("DURU_ADMISSION_ALPHA", "1")
+        monkeypatch.setattr(time, "monotonic", lambda: 100.0)
+        idle = case.r._table.begin_request("idle", 900)
+        idle.status = ProgramStatus.ACTING
+        idle.acting_since = 90.0
+        idle.assigned_replica = (7, 1)
+        busy = case.r._table.begin_request("busy", 100)
+        busy.assigned_replica = (7, 0)
+    candidate = case.put("candidate", 1100 if override else 100, 2)
+
+    await case.resume()
+
+    assert candidate.assigned_replica == ((7, 1) if override else (7, 0))
+    assert case.events[0]["forced"] is override
+    assert case.events[0]["remaining"] == (100 if override else 1000)
+
+
+async def test_duru_waits_for_policy_even_with_zero_native_timeout(case, monkeypatch):
+    case.r._cfg.resume_timeout_seconds = 0
+    case.score("waiting", 0.1)
+    task = await case.start("waiting", 1100)
+    assert not task.done()
+    assert case.r._stat_forced_resumes == 0
+
+    monkeypatch.setenv("DURU_ADMISSION_ALPHA", "1")
+    case.scores["waiting"]["score"] = 1
+    await case.resume()
+
+    decision = await asyncio.wait_for(task, 1)
+    assert decision.assigned_replica_hint == (1, 0)
+    assert case.r._stat_forced_resumes == 1
+
+
+@pytest.mark.parametrize("high_score", [0.9, 1.0])
+async def test_highest_score_exception_precedes_lower_score_backfill(
+    case, monkeypatch, high_score
+):
+    monkeypatch.setenv("DURU_ADMISSION_ALPHA", "1")
+    resident = case.r._table.begin_request("resident", 600)
+    resident.assigned_replica = (1, 0)
+    case.put("high", 700, high_score)
+    case.put("backfill", 200, 0.1)
+
+    await case.resume()
+
+    # There is no capacity-only pass over the queue. A high-score override
+    # happens before a lower-ranked candidate can consume the remaining 400.
+    assert case.admitted == (["high"] if high_score == 1.0 else ["backfill"])
+    assert case.events[0]["forced"] is (high_score == 1.0)
+
+
+@pytest.mark.parametrize("demand,forced", [(100, False), (101, True)])
+async def test_host_checks_fit_before_alpha_and_preserves_replica_ties(
+    case, monkeypatch, demand, forced
+):
+    monkeypatch.setenv("DURU_ADMISSION_ALPHA", "0.7")
+    case.cap.caps = {(7, 1): 100, (7, 0): 100}
+    program = case.put("high", demand, 0.7)
+
+    if forced:
+        await case.resume()
+    else:
+        # A fit must never consult the exception, even when score >= alpha.
+        with patch.object(
+            router_module.DuruResumePlan,
+            "may_force_admit",
+            side_effect=AssertionError("Capacity fit must precede alpha exception"),
+        ):
+            await case.resume()
+
+    assert program.assigned_replica == ((7, 1) if forced else (7, 0))
+    assert case.events[0]["forced"] is forced
+
+
+@pytest.mark.parametrize("channel", [None, "", "   "])
+def test_duru_requires_score_channel_before_startup(monkeypatch, channel):
+    if channel is None:
+        monkeypatch.delenv("DURU_SCORES", raising=False)
+    else:
+        monkeypatch.setenv("DURU_SCORES", channel)
+    with pytest.raises(ValueError, match="DURU_SCORES.*IPC channel"):
+        DuruScheduler(
+            Capacity(), ThunderAgentConfig(), reader=Reader(snapshot_source=lambda: {})
+        )
+    with pytest.raises(ValueError, match="DURU_SCORES.*IPC channel"):
+        Reader()
+
+
+def test_policies_and_prepared_plans_keep_their_own_scores(monkeypatch, caplog):
+    monkeypatch.setenv("DURU_SCORES", "test-channel")
+    monkeypatch.setenv("DURU_DIAGNOSTICS", "1")
+    caplog.set_level("INFO", logger="dynamo.duru_router.diagnostics")
+    programs = [router_module.Program(pid) for pid in ("a", "b")]
+    snapshots = [
+        dict(
+            run_id=str(index),
+            observation_time=time.time() - index * 0.1,
+            programs={
+                pid: dict(score=score, U=score, request_id=f"{index}-{pid}")
+                for pid, score in zip(("a", "b"), scores)
+            },
+        )
+        for index, scores in enumerate(((2, 1), (1, 2)))
+    ]
+    readers = [Reader(snapshot_source=lambda s=s: s) for s in snapshots]
+    schedulers = [
+        DuruScheduler(Capacity(), ThunderAgentConfig(), reader=reader)
+        for reader in readers
+    ]
+    first, second = [scheduler._policy for scheduler in schedulers]
+    plan = first.prepare_resume(programs, ThunderAgentConfig())
+    other = second.prepare_resume(programs, ThunderAgentConfig())
+    assert [p.program_id for p in plan.programs] == ["a", "b"]
+    assert [p.program_id for p in other.programs] == ["b", "a"]
+    assert first.score_row("a")["score"] == 2
+    assert second.score_row("a")["score"] == 1
+
+    # A later decision must not change an already prepared plan's audit identity.
+    readers[0].snapshot_source = lambda: snapshots[1]
+    first.prepare_resume(programs, ThunderAgentConfig())
+    plan.record_admission(programs[0], ResumeChoice((1, 0), 1000, 0.85), 0)
+    row = json.loads(caplog.records[-1].getMessage().split(" ", 1)[1])
+    assert row["run_id"] == "0"
+    assert row["request_id"] == "0-a"
+    assert row["observation_time"] == snapshots[0]["observation_time"]
+    assert row["U"] == 2
+
+    readers[0].snapshot_source = lambda: {}
+    assert not first.admission_ready("a")
+    assert second.admission_ready("a")

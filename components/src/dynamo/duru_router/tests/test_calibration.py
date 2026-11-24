@@ -6,10 +6,14 @@ import unittest
 from functools import partial
 from pathlib import Path
 
+import pytest
+
 from dynamo.duru_router.calibration.measure import load, measure
 from dynamo.duru_router.calibration.plan import METRIC, design
 from dynamo.duru_router.calibration.predict import predict, predict_prefill_table
 from dynamo.duru_router.scoring import LiveU
+
+pytestmark = [pytest.mark.pre_merge, pytest.mark.unit, pytest.mark.gpu_0]
 
 
 class CalibrationTest(unittest.TestCase):
@@ -145,12 +149,16 @@ class CalibrationTest(unittest.TestCase):
                 reset=primed.clear,
             )
             result = run(plan)
-            self.assertTrue(result["measurement_only"])
             self.assertNotIn("quality_passed", result)
             self.assertNotIn("validation", result)
             self.assertAlmostEqual(result["prefill"]["wall_ms"][0][0], 3)
             loaded = load(root / "cal/calibration.json", contract)
             self.assertEqual(loaded, result)
+            legacy_path = root / "legacy.json"
+            legacy_path.write_text(json.dumps(dict(result, measurement_only=True)))
+            legacy = load(legacy_path, contract)
+            self.assertEqual(legacy["prefill"], loaded["prefill"])
+            self.assertEqual(legacy["decode"], loaded["decode"])
             self.assertEqual(
                 run(plan, resume=True),
                 result,
@@ -159,6 +167,14 @@ class CalibrationTest(unittest.TestCase):
                 load(root / "cal/calibration.json", dict(contract, model="other"))
             with self.assertRaises(ValueError):
                 run(dict(plan, repeats=2), resume=True)
+            legacy_plan = dict(
+                plan,
+                measurement_only=True,
+                point_selection="graph_neighbors_and_geometric_context_v1",
+            )
+            legacy_run = partial(measure, root / "legacy-cal", contract, **run.keywords)
+            legacy_result = legacy_run(legacy_plan)
+            self.assertEqual(legacy_run(legacy_plan, resume=True), legacy_result)
             result["prefill"]["wall_ms"][0][0] = 0
             (root / "bad.json").write_text(json.dumps(result))
             with self.assertRaises(ValueError):

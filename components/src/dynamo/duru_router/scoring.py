@@ -1,16 +1,14 @@
-"""Calculate U and publish live scores from ingress and accepted-work journals.
+"""Calculate live U from bounded IPC, with optional diagnostic recordings.
 
-A common journal watermark keeps E and W at the same observation time. Engine
-heartbeats use a serialized node-local compact journal, outside the utility queue.
+A common producer watermark keeps entitlement and accepted work at the same
+observation time. Recorded events are for diagnostics and offline validation only.
 """
 
-import argparse
 import heapq
 import json
 import logging
 import math
 import os
-import signal
 import threading
 import time
 import uuid
@@ -22,12 +20,18 @@ from pathlib import Path
 from dynamo.duru_router.admission import priority_key as priority_key
 from dynamo.duru_router.calibration.measure import load as load_calibration
 from dynamo.duru_router.calibration.predict import predict
-from dynamo.duru_router.events import open_journal
+from dynamo.duru_router.diagnostics import PerformanceLogger
+from dynamo.duru_router.events import open_feed, open_journal
+from dynamo.duru_router.transport import (
+    Receiver,
+    ScorePublisher,
+    ScoreSubscriber,
+    channel_path,
+    transport,
+)
 
 logger = logging.getLogger(__name__)
-
-METRIC = "root_hierarchical_ps_accepted_work_v3"
-EXTRAPOLATION_POLICY = "positive_finite_edge_slope_v1"
+MAX_PENDING_EVENTS = 262144
 
 
 class LiveU:
@@ -45,7 +49,6 @@ class LiveU:
         self.entitlement = Counter()
         self.work = Counter()
         self.invalid = Counter()
-        self.executed_agents = set()
         self.last = None
         self.agent_root = {}
         self.accepted_steps = 0
@@ -89,6 +92,18 @@ class LiveU:
                 if not self.root_active[req["root"]]:
                     del self.root_active[req["root"]]
 
+    def finish_root(self, root, now):
+        """Called only after the root and all descendants have stopped producing work."""
+        self.advance(now)
+        if self.root_active[root]:
+            raise ValueError("Root completed with outstanding requests: " + root)
+        agents = [agent for agent, owner in self.agent_root.items() if owner == root]
+        for agent in agents:
+            del self.agent_root[agent]
+            self.agent_active_requests.pop(agent, None)
+        for table in (self.entitlement, self.work, self.invalid, self.root_active):
+            table.pop(root, None)
+
     @lru_cache(maxsize=32768)
     def cost(self, phase, p, d, k):
         ms, outside = predict(self.calibration[phase], dict(phase=phase, p=p, d=d, k=k))
@@ -100,14 +115,10 @@ class LiveU:
             self.extrapolated_cost_evaluations += 1
         return ms / 1000.0
 
-    def dispatched(self, agent):
-        self.executed_agents.add(agent)
-
     def accepted(self, step):
         if not step["accepted"]:
             return
-        root, agent = step["root"], step["agent"]
-        self.dispatched(agent)
+        root = step["root"]
         cost = self.cost(step["phase"], step["p"], step["d"], step["k"])
         self.accepted_steps += 1
         self.output_tokens += step["generated_tokens"]
@@ -156,14 +167,21 @@ class LiveU:
         )
 
 
+def score_channel():
+    value = os.environ.get("DURU_SCORES", "")
+    if not value.strip():
+        raise ValueError("DURU_SCORES must name the configured score IPC channel")
+    return Path(value)
+
+
 class Reader:
-    def __init__(self):
-        self.path = Path(os.environ["DURU_SCORES"])
-        self.last = 0.0
+    def __init__(self, snapshot_source=None):
+        self.snapshot_source = snapshot_source
+        self.path = None if snapshot_source is not None else score_channel()
+        self._subscriber = None
         self.snapshot = {}
         self.reason = "missing_snapshot"
         self.age = None
-        self.counters = {}
         self.pinned = None
 
     def pin(self, snapshot):
@@ -178,15 +196,15 @@ class Reader:
 
         return decision()
 
-    def refresh(self, force=False):
+    def refresh(self):
         if self.pinned is not None:
             return self.pinned
-        if force or time.monotonic() - self.last >= 0.02:
-            self.last = time.monotonic()
-            try:
-                self.snapshot = json.loads(self.path.read_text())
-            except FileNotFoundError:
-                self.snapshot = {}
+        if self.snapshot_source is not None:
+            self.snapshot = self.snapshot_source()
+        else:
+            if self._subscriber is None:
+                self._subscriber = ScoreSubscriber(channel_path(self.path))
+            self.snapshot = self._subscriber.snapshot()
         self.age = (
             time.time() - self.snapshot.get("observation_time", 0)
             if self.snapshot
@@ -201,45 +219,44 @@ class Reader:
         else:
             self.reason = "fresh"
             return self.snapshot
-        self.counters[self.reason] = self.counters.get(self.reason, 0) + 1
         return {}
 
+    def close(self):
+        if self._subscriber is not None:
+            self._subscriber.close()
+        self.snapshot = {}
 
-class Tail:
+
+class MemoryTail:
+    """Consume one ordered IPC event stream through its terminal watermark."""
+
     def __init__(self, path):
         self.path = Path(path)
-        self.offset = 0
         self.sequence = 0
         self.watermark = 0.0
         self.closed = False
+        self.receiver = None
 
     def read(self):
-        if not self.path.exists():
+        if self.closed:
             return []
-        assert self.path.stat().st_size >= self.offset, "Journal truncated"
-        result = []
-        with self.path.open("rb") as f:
-            f.seek(self.offset)
-            while True:
-                pos = f.tell()
-                line = f.readline()
-                if not line.endswith(b"\n"):
-                    f.seek(pos)
-                    break
-                if self.closed:
-                    raise ValueError(f"Event after journal footer: {self.path}")
-                r = json.loads(line)
-                self.closed = r["event"] == "footer"
-                self.sequence += 1
-                assert r["sequence"] == self.sequence, (
-                    "Journal gap",
-                    self.path,
-                    self.sequence,
-                )
-                self.watermark = max(self.watermark, r["time"])
-                result.append(r)
-            self.offset = f.tell()
-        return result
+        if self.receiver is None:
+            try:
+                self.receiver = Receiver(channel_path(self.path))
+            except FileNotFoundError:
+                return []
+        rows = self.receiver.read()
+        for row in rows:
+            if self.closed or row["sequence"] != self.sequence + 1:
+                raise ValueError("Duru memory feed sequence gap or event after footer")
+            self.sequence += 1
+            self.watermark = max(self.watermark, row["time"])
+            self.closed = row["event"] == "footer"
+        return rows
+
+    def close(self):
+        if self.receiver is not None:
+            self.receiver.close()
 
 
 def _program_id(fields):
@@ -253,18 +270,28 @@ class Ingress:
     """Publish request lifecycle events with explicit router program identity."""
 
     def __init__(self, path):
-        self.journal = open_journal(path, name="duru-ingress")
+        self.journal = open_feed(path, name="duru-ingress")
         self.sequence = 0
 
     def emit(self, event, timestamp, **fields):
-        if event not in ("send", "end", "cancel", "error", "u_clock", "footer"):
+        if event not in (
+            "send",
+            "dispatch",
+            "end",
+            "cancel",
+            "error",
+            "program_end",
+            "root_end",
+            "u_clock",
+            "footer",
+        ):
             return
         if event == "send":
             _program_id(fields)
         keys = (
             ("request_id", "program_id", "root", "agent", "prompt_tokens")
             if event == "send"
-            else ("request_id",)
+            else ("request_id", "program_id", "root")
         )
         self.sequence += 1
         self.journal.submit(
@@ -284,55 +311,98 @@ class Ingress:
             self.journal.close()
 
 
-def run(config, stop=None):
+def run(config, stop=None, *, publish=None):
+    if transport() != "memory":
+        raise ValueError(
+            "Live U accounting requires IPC (DURU_ACCOUNTING_TRANSPORT=memory)"
+        )
     cfg = json.loads(Path(config).read_text())
     stop = stop if stop is not None else threading.Event()
     score_path = Path(cfg["scores"])
     score_path.parent.mkdir(parents=True, exist_ok=True)
-    score_path.unlink(missing_ok=True)
     if not cfg["ledgers"]:
         raise ValueError("At least one worker ledger is required")
     run_id = uuid.uuid4().hex
     book = LiveU(
         cfg["capacity"], load_calibration(cfg["calibration"], cfg["runtime_contract"])
     )
-    sources = [Tail(Path(cfg["ingress"]))] + [Tail(p) for p in cfg["ledgers"]]
-    audit = open_journal(
-        cfg.get("audit_dir", score_path.parent), name="duru-control", fresh=False
+    sources = [MemoryTail(cfg["ingress"])] + [MemoryTail(p) for p in cfg["ledgers"]]
+    audit = (
+        open_journal(
+            cfg.get("audit_dir", score_path.parent), name="duru-control", fresh=False
+        )
+        if os.environ.get("DURU_RECORD_EVENTS") == "1"
+        else None
     )
     sequence = 0
     heap = []
     serial = 0
     last_save = 0.0
     last_snapshot = None
+    performance = PerformanceLogger()
     # Completed requests can still receive accepted-work callbacks.
     request_identities = {}
     request_programs = {}
     program_identities = {}
+    worker_requests = set()
+    closing_roots = set()
     stopped_cleanly = False
+    max_identities = 100000
+    shutdown_deadline = None
+    score_publisher = None
+
+    def release_root(root, at):
+        if any(request_identities[rid][0] == root for rid in worker_requests):
+            return
+        book.finish_root(root, at)
+        for rid, identity in list(request_identities.items()):
+            if identity[0] == root:
+                request_identities.pop(rid)
+                request_programs.pop(rid, None)
+        for pid, identity in list(program_identities.items()):
+            if identity[0] == root:
+                program_identities.pop(pid)
+        closing_roots.discard(root)
+
     try:
+        score_publisher = ScorePublisher(channel_path(score_path))
         while True:
             stopping = stop.is_set()
+            if stopping and shutdown_deadline is None:
+                shutdown_deadline = time.monotonic() + 5
+            made_progress = False
             for index, source in enumerate(sources):
                 for row in source.read():
+                    made_progress = True
                     if index == 0:
                         if row["event"] in (
                             "send",
+                            "dispatch",
                             "end",
                             "cancel",
                             "error",
+                            "program_end",
+                            "root_end",
                         ):
                             serial += 1
                             heapq.heappush(heap, (row["time"], serial, "ingress", row))
-                    elif row["event"] in ("scheduled", "accepted_output"):
-                        for st in row["steps"]:
-                            at = (
-                                st["scheduled_at"]
-                                if row["event"] == "scheduled"
-                                else st["end"]
+                            if len(heap) > MAX_PENDING_EVENTS:
+                                raise RuntimeError("Duru pending-event limit exceeded")
+                    elif row["event"] == "request_end":
+                        for identity in row["requests"]:
+                            serial += 1
+                            heapq.heappush(
+                                heap, (row["time"], serial, "request_end", identity)
                             )
+                            if len(heap) > MAX_PENDING_EVENTS:
+                                raise RuntimeError("Duru pending-event limit exceeded")
+                    elif row["event"] == "accepted_output":
+                        for st in row["steps"]:
+                            at = st["end"]
                             serial += 1
                             heapq.heappush(heap, (at, serial, row["event"], st))
+                            if len(heap) > MAX_PENDING_EVENTS:
+                                raise RuntimeError("Duru pending-event limit exceeded")
             # Closed journals cannot contribute later events or hold back other sources.
             watermark = min(
                 (s.watermark for s in sources if not s.closed),
@@ -347,6 +417,13 @@ def run(config, stop=None):
                         book.last,
                         kind,
                     )
+                    if (
+                        len(heap) > MAX_PENDING_EVENTS
+                        or len(request_identities) > max_identities
+                    ):
+                        raise RuntimeError(
+                            "Duru accounting state limit exceeded; check completion events"
+                        )
                     # Accepted steps do not change active roots or agents.
                     # Integrate E only on ingress transitions and at publication.
                     # This is the same integral without O(steps * active roots).
@@ -371,11 +448,35 @@ def run(config, stop=None):
                                 r["prompt_tokens"],
                                 at,
                             )
+                        elif r["event"] == "dispatch":
+                            if r["request_id"] not in request_identities:
+                                raise ValueError("Dispatch without ingress request")
+                            worker_requests.add(r["request_id"])
+                        elif r["event"] == "root_end":
+                            root = r["root"]
+                            if book.root_active[root]:
+                                raise ValueError(
+                                    "Root completed with outstanding requests: " + root
+                                )
+                            closing_roots.add(root)
+                            release_root(root, at)
+                        elif r["event"] == "program_end":
+                            pid = _program_id(r)
+                            if pid in request_programs.values():
+                                raise ValueError(
+                                    "Program completed with outstanding requests: "
+                                    + pid
+                                )
+                            program_identities.pop(pid, None)
                         else:
                             book.finish(r["request_id"], at)
                             request_programs.pop(r["request_id"], None)
                     else:
                         request_id = r["client_request_id"]
+                        # Terminal acknowledgements are idempotent. Old harnesses
+                        # without dispatch tracking do not require this barrier.
+                        if kind == "request_end" and request_id not in worker_requests:
+                            continue
                         if request_id not in request_identities:
                             raise ValueError("Unjoined work: " + request_id)
                         if (r.get("root"), r.get("agent")) != request_identities[
@@ -384,8 +485,10 @@ def run(config, stop=None):
                             raise ValueError(
                                 "Worker request identity mismatch: " + request_id
                             )
-                        if kind == "scheduled":
-                            book.dispatched(r["agent"])
+                        if kind == "request_end":
+                            worker_requests.discard(request_id)
+                            if r["root"] in closing_roots:
+                                release_root(r["root"], at)
                         else:
                             book.accepted(r)
                 book.advance(watermark)
@@ -412,22 +515,31 @@ def run(config, stop=None):
                 snapshot = dict(
                     schema=1,
                     run_id=run_id,
-                    metric=METRIC,
-                    extrapolation_policy=EXTRAPOLATION_POLICY,
                     extrapolated_cost_evaluations=book.extrapolated_cost_evaluations,
-                    entitlement_scope="hierarchical PS: root rate min(active agents, replicas / active roots)",
                     time=time.time(),
                     observation_time=watermark,
                     capacity=book.capacity,
-                    live_accounting="compact_local_v1",
-                    source_watermarks=[x.watermark for x in sources],
-                    source_offsets=[x.offset for x in sources],
+                    accounting_state=dict(
+                        request_identities=len(request_identities),
+                        program_identities=len(program_identities),
+                        agents=len(book.agent_root),
+                        roots=len(book.entitlement),
+                        pending_events=len(heap),
+                        worker_requests=len(worker_requests),
+                        closing_roots=len(closing_roots),
+                    ),
                     requests=requests,
                     programs=programs,
                     accepted_steps=book.accepted_steps,
                     output_tokens=book.output_tokens,
-                    executed_agents=sorted(book.executed_agents),
-                    roots={
+                )
+                if audit is not None:
+                    snapshot.update(
+                        source_watermarks=[x.watermark for x in sources],
+                        source_sequences=[x.sequence for x in sources],
+                    )
+                if audit is not None or performance.enabled:
+                    snapshot["roots"] = {
                         r: dict(
                             E=book.entitlement[r],
                             W=book.work[r],
@@ -435,21 +547,23 @@ def run(config, stop=None):
                             invalid_steps=book.invalid[r],
                             active_agents=book.root_active[r],
                         )
-                        for r in book.agent_root.values()
-                    },
-                )
-                raw = json.dumps(snapshot)
-                tmp = score_path.with_suffix(".tmp")
-                tmp.write_text(raw)
-                tmp.replace(score_path)
+                        for r in set(book.agent_root.values())
+                    }
+                if score_publisher is not None:
+                    score_publisher.publish(snapshot)
+                if publish is not None:
+                    publish(snapshot)
                 last_snapshot = snapshot
-                if time.monotonic() - last_save >= 1:
+                performance.observe(snapshot, len(heap))
+                if audit is not None and time.monotonic() - last_save >= 1:
                     sequence += 1
                     audit.submit(
                         "record", dict(sequence=sequence, event="snapshot", **snapshot)
                     )
                     last_save = time.monotonic()
             if stopping:
+                if made_progress and time.monotonic() < shutdown_deadline:
+                    continue
                 stopped_cleanly = True
                 break
             stop.wait(0.05)
@@ -460,46 +574,86 @@ def run(config, stop=None):
                     "Stopping with %d events beyond the common watermark", len(heap)
                 )
             sequence += 1
-            audit.submit(
-                "record",
-                dict(
-                    sequence=sequence,
-                    event="footer",
-                    run_id=run_id,
-                    time=time.time(),
-                    last_snapshot=last_snapshot,
-                    pending_events=len(heap),
-                    inputs_closed=all(source.closed for source in sources),
-                    complete=stopped_cleanly
-                    and all(source.closed for source in sources)
-                    and not heap,
-                ),
-            )
+            if audit is not None:
+                audit.submit(
+                    "record",
+                    dict(
+                        sequence=sequence,
+                        event="footer",
+                        run_id=run_id,
+                        time=time.time(),
+                        last_snapshot=last_snapshot,
+                        pending_events=len(heap),
+                        inputs_closed=all(source.closed for source in sources),
+                        complete=stopped_cleanly
+                        and all(source.closed for source in sources)
+                        and not heap,
+                    ),
+                )
         finally:
             try:
-                audit.close()
+                if audit is not None:
+                    audit.close()
+                for source in sources:
+                    source.close()
             finally:
-                score_path.unlink(missing_ok=True)
+                if publish is not None:
+                    publish({})
+                if score_publisher is not None:
+                    score_publisher.close()
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Calculate and publish Duru U scores")
-    parser.add_argument("config", help="JSON service configuration")
-    args = parser.parse_args(argv)
-    stop = threading.Event()
+class RouterAccounting:
+    """Router-owned accounting, with one background thread for bounded event batches.
 
-    def request_stop(signum, frame):
-        stop.set()
+    Published snapshots are replaced, never mutated. Router decisions read the
+    latest object directly; engine processes receive compact scores over IPC.
+    Errors invalidate the local snapshot and are surfaced by check()/close().
+    """
 
-    previous = {
-        sig: signal.signal(sig, request_stop) for sig in (signal.SIGINT, signal.SIGTERM)
-    }
-    try:
-        run(args.config, stop)
-    finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
+    def __init__(self, config):
+        self.config = config
+        self._snapshot = {}
+        self._stop = threading.Event()
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._run, name="duru-accounting", daemon=True
+        )
+        self.reader = Reader(snapshot_source=self.snapshot)
 
+    def snapshot(self):
+        self.check()
+        return self._snapshot
 
-if __name__ == "__main__":
-    main()
+    def _publish(self, snapshot):
+        self._snapshot = snapshot
+
+    def _run(self):
+        try:
+            run(self.config, self._stop, publish=self._publish)
+        except BaseException as exc:
+            self._snapshot = {}
+            self._error = exc
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def check(self):
+        if self._error is not None:
+            raise RuntimeError("Router U accounting failed") from self._error
+        if (
+            self._thread.ident is not None
+            and not self._thread.is_alive()
+            and not self._stop.is_set()
+        ):
+            raise RuntimeError("Router U accounting stopped unexpectedly")
+
+    def close(self):
+        self._stop.set()
+        if self._thread.ident is not None:
+            self._thread.join(15)
+            if self._thread.is_alive():
+                raise TimeoutError("Router U accounting did not stop")
+        self._snapshot = {}
+        self.check()

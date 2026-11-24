@@ -1,12 +1,12 @@
 """Duru decisions from explicit inputs, independent of routers and engine APIs.
 
-Hosts own freshness, observations, resource accounting, and applying decisions.
-Resource keys are opaque; tie_break supplies the host's deterministic fit order.
+Hosts own capacity checks, placement, freshness, observations and accounting.
+Duru supplies queue order, admission ceilings and alpha-exception eligibility.
 """
 
 from dataclasses import dataclass
 from math import isfinite
-from typing import Hashable, NamedTuple
+from typing import NamedTuple
 
 
 def valid_score(value):
@@ -39,34 +39,16 @@ class Candidate(NamedTuple):
         )
 
 
-class Resource(NamedTuple):
-    key: Hashable
-    capacity: int
-    used: int
-    tie_break: int = 0
-    used_decayed: int | None = None
-
-
-class Admission(NamedTuple):
-    resource: Hashable
-    remaining: int
-    ceiling: float
-    forced: bool = False
-
-
 @dataclass(frozen=True, slots=True)
 class DuruPolicy:
     alpha: float | None = None
     resume_ceiling: float = 1.0
-    enabled: bool = True
 
     def __post_init__(self):
         if self.alpha is not None and (not isfinite(self.alpha) or self.alpha <= 0):
             raise ValueError("Admission alpha must be finite and positive")
 
     def order(self, candidates: list[Candidate]) -> list[Candidate]:
-        if not self.enabled:
-            return list(candidates)
         return [
             candidate
             for _, candidate in sorted(
@@ -84,54 +66,8 @@ class DuruPolicy:
 
     def may_force_admit(self, candidate: Candidate) -> bool:
         return bool(
-            self.enabled
-            and self.alpha is not None
+            self.alpha is not None
             and candidate.pending_request
             and valid_score(candidate.score)
             and candidate.score >= self.alpha
-        )
-
-    def select(
-        self,
-        candidate: Candidate,
-        resources: list[Resource],
-        *,
-        established_waiters: bool,
-    ) -> Admission | None:
-        ceiling = self.ceiling(candidate, established_waiters)
-        fits = [
-            (r, int(r.capacity * ceiling) - r.used)
-            for r in resources
-            if r.capacity > 0 and int(r.capacity * ceiling) - r.used >= candidate.demand
-        ]
-        if not fits:
-            return None
-        resource, remaining = max(fits, key=lambda pair: (pair[1], pair[0].tie_break))
-        return Admission(resource.key, remaining, ceiling)
-
-    def select_override(
-        self,
-        candidate: Candidate,
-        resources: list[Resource],
-        *,
-        established_waiters: bool,
-    ) -> Admission | None:
-        """Called only after fit fails; the host supplies current decayed usage."""
-        if not self.may_force_admit(candidate):
-            return None
-        usable = [r for r in resources if r.capacity > 0]
-        if not usable:
-            return None
-        resource = max(
-            usable,
-            key=lambda r: (
-                r.capacity - (r.used if r.used_decayed is None else r.used_decayed)
-            ),
-        )
-        ceiling = self.ceiling(candidate, established_waiters)
-        return Admission(
-            resource.key,
-            int(resource.capacity * ceiling) - resource.used,
-            ceiling,
-            True,
         )
