@@ -13,11 +13,11 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import pytest_asyncio
 
 from dynamo.duru_router import __main__ as main_module
-from dynamo.duru_router.__main__ import DuruRouterHandler
+from dynamo.duru_router.__main__ import AccountingUnavailable, DuruRouterHandler
 from dynamo.duru_router.events import CompactFeed
-from dynamo.duru_router.handler import AccountingUnavailable
 from dynamo.duru_router.router import ThunderAgentConfig
 from dynamo.duru_router.scoring import Ingress, RouterAccounting
 from dynamo.duru_router.tests.helpers import configuration
@@ -63,7 +63,7 @@ class AccountingKvRouter(FakeKvRouter):
         return stream
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def handler(monkeypatch, tmp_path):
     path, cfg = configuration(tmp_path)
     monkeypatch.setenv("DURU_DIAGNOSTICS", "1")
@@ -141,6 +141,7 @@ async def generate(handler, pid, tokens=8, **kwargs):
     return [chunk async for chunk in handler.generate(request, **kwargs)]
 
 
+@pytest.mark.asyncio
 async def test_dp_capacity_pins_and_packed_tokens(handler):
     handler._config = SimpleNamespace(namespace="test", endpoint="test.vllm.generate")
     context = object()
@@ -159,6 +160,7 @@ async def test_dp_capacity_pins_and_packed_tokens(handler):
     assert metrics[0]["counters"]["program_requests_total"] == 2
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("terminal", [False, True])
 async def test_stream_usage_keeps_duru_reservation_accurate(handler, terminal):
     chunks = [
@@ -184,6 +186,7 @@ async def test_stream_usage_keeps_duru_reservation_accurate(handler, terminal):
     )
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("ending", ["cancel", "session_final"])
 async def test_paused_request_never_dispatches_after_termination(
     handler, monkeypatch, ending
@@ -236,6 +239,7 @@ def test_main_parses_alpha_and_forwards_router_arguments(monkeypatch, tmp_path):
     assert sys.argv == ["duru", "--endpoint", "test.vllm.generate"]
 
 
+@pytest.mark.asyncio
 async def test_public_requests_join_worker_accounting_and_cleanup_family(handler):
     request = {
         "token_ids": [1, 2, 3],
@@ -275,6 +279,7 @@ async def test_public_requests_join_worker_accounting_and_cleanup_family(handler
     assert not handler.sessions and not handler.roots
 
 
+@pytest.mark.asyncio
 async def test_anonymous_request_releases_accounting_without_session_final(handler):
     assert [chunk async for chunk in handler.generate({"token_ids": [1, 2]})] == []
     snapshot = await snapshot_when(
@@ -284,6 +289,7 @@ async def test_anonymous_request_releases_accounting_without_session_final(handl
     assert not handler.sessions
 
 
+@pytest.mark.asyncio
 async def test_accounting_failure_returns_503_and_keeps_endpoints_available(
     handler, monkeypatch
 ):
@@ -342,6 +348,7 @@ async def test_accounting_failure_returns_503_and_keeps_endpoints_available(
         await asyncio.gather(service, request, return_exceptions=True)
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pulling", [False, True])
 async def test_accounting_failure_does_not_cancel_dispatched_stream(handler, pulling):
     entered = asyncio.Event()
@@ -399,6 +406,7 @@ async def test_accounting_failure_does_not_cancel_dispatched_stream(handler, pul
         await stream.aclose()
 
 
+@pytest.mark.asyncio
 async def test_ingress_failure_returns_503_before_dispatch(handler, monkeypatch):
     original = handler.ingress.emit
 
@@ -418,12 +426,14 @@ async def test_ingress_failure_returns_503_before_dispatch(handler, monkeypatch)
         await generate(handler, "next")
 
 
+@pytest.mark.asyncio
 async def test_intentional_shutdown_stops_monitor_without_failure(handler):
     await handler.shutdown()
     await asyncio.wait_for(handler.test_monitor, 1)
     assert handler.failure is None
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("pulling", [False, True])
 async def test_session_final_closes_stream_across_per_chunk_tasks(handler, pulling):
     entered = asyncio.Event()

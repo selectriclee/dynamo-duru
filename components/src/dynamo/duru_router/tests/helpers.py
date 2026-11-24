@@ -1,13 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared CPU accounting configuration and isolated IPC environment."""
+"""Shared CPU fixtures and recorded-event replay helpers."""
 
 import json
+import os
 import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+from dynamo.duru_router import scoring
 from dynamo.duru_router.calibration.plan import METRIC
 
 
@@ -46,3 +50,51 @@ def configuration(tmp_path):
     path = tmp_path / "config.json"
     path.write_text(json.dumps(cfg))
     return path, cfg
+
+
+class Tail:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.offset = 0
+        self.sequence = 0
+        self.received_through = 0.0
+        self.closed = False
+
+    def read(self):
+        if not self.path.exists():
+            return []
+        assert self.path.stat().st_size >= self.offset, "Journal truncated"
+        result = []
+        with self.path.open("rb") as f:
+            f.seek(self.offset)
+            while True:
+                pos = f.tell()
+                line = f.readline()
+                if not line.endswith(b"\n"):
+                    f.seek(pos)
+                    break
+                if self.closed:
+                    raise ValueError(f"Event after journal footer: {self.path}")
+                r = json.loads(line)
+                self.closed = r["event"] == "footer"
+                self.sequence += 1
+                assert r["sequence"] == self.sequence, (
+                    "Journal gap",
+                    self.path,
+                    self.sequence,
+                )
+                self.received_through = max(self.received_through, r["time"])
+                result.append(r)
+            self.offset = f.tell()
+        return result
+
+    def close(self):
+        pass
+
+
+def replay_accounting(config, stop=None, *, router_publish=None):
+    with (
+        patch.object(scoring, "EventStreamReader", Tail),
+        patch.dict(os.environ, DURU_ACCOUNTING_TRANSPORT="memory"),
+    ):
+        scoring.run(config, stop, router_publish=router_publish)

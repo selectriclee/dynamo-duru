@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from dynamo.duru_router.events import CompactFeed, open_journal
-from dynamo.duru_router.tests.replay_helpers import Tail
+from dynamo.duru_router.tests.helpers import Tail
 
 pytestmark = [
     pytest.mark.post_merge,

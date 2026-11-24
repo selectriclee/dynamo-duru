@@ -6,7 +6,7 @@ Duru adds U-based fairness to Dynamo while reusing ThunderAgent admission and na
 
 ```mermaid
 flowchart LR
-    F["Dynamo frontend"] -->|"Dynamo runtime"| R["Router process<br/>handler.py + router.py"]
+    F["Dynamo frontend"] -->|"Dynamo runtime"| R["Router process<br/>__main__.py + router.py"]
     R -->|"Dynamo runtime"| B["vLLM service process<br/>vllm/handlers.py"]
     B -->|"vLLM IPC"| E["Engine process<br/>worker.py"]
 ```
@@ -33,7 +33,6 @@ File labels without a directory refer to this package.
 
 | File | Responsibility |
 | --- | --- |
-| [handler.py](handler.py) | Attach identities, report request lifecycle, and supervise accounting failures. |
 | [router.py](router.py) | Connect fresh scores and Duru admission rules to ThunderAgent. |
 | [admission.py](admission.py) | Order candidates, set admission ceilings, and authorize alpha exceptions. |
 | [worker.py](worker.py) | Order native vLLM waiting queues and report accepted engine work. |
@@ -43,7 +42,7 @@ File labels without a directory refer to this package.
 | [diagnostics.py](diagnostics.py) | Log optional admission decisions, throughput, and U summaries. |
 | [calibration/](calibration/README.md) | Plan and measure solo engine costs, then predict accepted-work costs. |
 | [args.py](args.py) | Reuse ThunderAgent CLI configuration. |
-| [__main__.py](__main__.py) | Start accounting and the shared serving endpoints; require alpha. |
+| [__main__.py](__main__.py) | Handle requests and their identities, supervise accounting, and start the shared serving endpoints. |
 
 ThunderAgent owns [capacity checks and reservations](../thunderagent_router/router.py)
 and [request forwarding](../thunderagent_router/__main__.py).
