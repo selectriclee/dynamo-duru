@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 Sehyeon Lee (sehyeon2@illinois.edu)
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Duru router
 
 Duru adds U-based fairness to Dynamo while reusing ThunderAgent admission and native vLLM scheduling.

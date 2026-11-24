@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Sehyeon Lee (sehyeon2@illinois.edu)
+# SPDX-License-Identifier: Apache-2.0
+
 """Exercise Duru accounting against CPU-only native scheduler callbacks."""
 
 import importlib.util

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Sehyeon Lee (sehyeon2@illinois.edu)
+# SPDX-License-Identifier: Apache-2.0
+
 """Measure solo accepted work through the same worker configuration used to serve."""
 
 import hashlib

@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 Sehyeon Lee (sehyeon2@illinois.edu)
 # SPDX-License-Identifier: Apache-2.0
+# Modified for Duru by Sehyeon Lee.
 
 """Duru router CLI parsing and config assembly."""
 

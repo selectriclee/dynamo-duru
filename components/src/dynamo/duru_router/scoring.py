@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Sehyeon Lee (sehyeon2@illinois.edu)
+# SPDX-License-Identifier: Apache-2.0
+
 """Calculate live U from local router events and worker IPC.
 
 A common observation cutoff keeps entitlement and accepted work at the same

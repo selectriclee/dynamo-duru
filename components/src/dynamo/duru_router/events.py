@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Sehyeon Lee (sehyeon2@illinois.edu)
+# SPDX-License-Identifier: Apache-2.0
+
 """Record completed work and clock updates for U accounting.
 
 Keep timestamps ordered so the scorer cannot advance past work that

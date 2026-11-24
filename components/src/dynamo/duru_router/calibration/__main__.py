@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Sehyeon Lee (sehyeon2@illinois.edu)
+# SPDX-License-Identifier: Apache-2.0
+
 """Plan graph-aware calibration points or measure them through a serving adapter."""
 
 import argparse
